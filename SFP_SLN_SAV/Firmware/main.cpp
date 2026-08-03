@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 7.0
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 7.1
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -56,7 +56,9 @@ RTC_DS3231 rtc;
 
 // --- VARIÁVEIS GLOBAIS ---
 DateTime agora;
-unsigned long ultimoCiclo = 0;
+unsigned long ultimoCicloLuz = 0;         // Cronômetro para a Luz (1s)
+unsigned long ultimoCicloUltrassom = 0;   // Cronômetro para o Ultrassom/Bomba (5s)
+
 int porcentagemAguaGlobal = 0; 
 int pwmAtualGlobal = 0; 
 bool estadoLuz = false;
@@ -121,7 +123,6 @@ void setup() {
     EEPROM.put(9, t5_anoitecerIni);
     EEPROM.put(11, t6_anoitecerFim);
     
-    // Configuração inicial do LDR salva como ATIVO (1)
     EEPROM.write(EEPROM_ADDR_LDR, 1); 
     EEPROM.write(0, EEPROM_INIT_CODE); 
   } else {
@@ -132,7 +133,6 @@ void setup() {
     EEPROM.get(9, t5_anoitecerIni);
     EEPROM.get(11, t6_anoitecerFim);
     
-    // Recupera o status do LDR salvo antes de reiniciar
     sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1; 
   }
 
@@ -153,7 +153,7 @@ void loop() {
   
   if (modoMenu == 0) agora = rtc.now(); 
 
-  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ (UP + DOWN por 1s) ---
+  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ ---
   bool btnUpCru = (digitalRead(BTN_UP) == LOW);
   bool btnDownCru = (digitalRead(BTN_DOWN) == LOW);
 
@@ -164,17 +164,12 @@ void loop() {
     } 
     else if (millis() - tempoBotoesPressione >= 1000) {
       sensorLuzAtivo = !sensorLuzAtivo; 
-      
-      // Salva a nova preferência na EEPROM imediatamente
       EEPROM.write(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
       
       lcd.clear();
       lcd.backlight();
-      if (sensorLuzAtivo) {
-        lcd.print("SENSOR DE LUZ ON"); 
-      } else {
-        lcd.print("SENSOR DE LUZ OF"); 
-      }
+      if (sensorLuzAtivo) lcd.print("SENSOR DE LUZ ON"); 
+      else lcd.print("SENSOR DE LUZ OF"); 
       
       delay(2000); 
       lcd.clear();
@@ -210,18 +205,23 @@ void loop() {
     }
   }
 
-  // --- CICLO PRINCIPAL (1 Segundo) ---
-  if (millis() - ultimoCiclo > 1000) {
-    ultimoCiclo = millis();
+  // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
+  if (millis() - ultimoCicloLuz >= 1000) {
+    ultimoCicloLuz += 1000; // Correção para evitar drift de tempo
     
     if (modoMenu == 0) {
       controlarLuz();
     }
+  }
+
+  // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
+  if (millis() - ultimoCicloUltrassom >= 5000) {
+    ultimoCicloUltrassom = millis(); 
     
-    atualizarBarraLEDsCFTV(); // Lê o ultrassônico e calcula porcentagemAguaGlobal
+    atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
     
     if (modoMenu == 0) {
-      controlarNivelAgua();   // Aciona ou desliga a válvula com base no nível
+      controlarNivelAgua();   // Avalia a histerese da válvula
     }
   }
 }
@@ -230,11 +230,11 @@ void loop() {
 void controlarNivelAgua() {
   if (porcentagemAguaGlobal <= 10 && !valvulaLigada) {
     valvulaLigada = true;
-    digitalWrite(PINO_VALVULA, HIGH); // Liga a válvula/bomba
+    digitalWrite(PINO_VALVULA, HIGH); 
   } 
   else if (porcentagemAguaGlobal >= 100 && valvulaLigada) {
     valvulaLigada = false;
-    digitalWrite(PINO_VALVULA, LOW);  // Desliga a válvula/bomba
+    digitalWrite(PINO_VALVULA, LOW);  
   }
 }
 
@@ -244,36 +244,27 @@ void controlarLuz() {
   long segundosDoDia = minutosAtuais * 60 + agora.second();
   int indiceLinearPWM = 0; 
 
-  // 1. 04:00 as 04:30 (Amanhecer)
   if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
     long segundosPassados = segundosDoDia - (t1_amanhecerIni * 60L);
     long segundosTotaisRampa = (t2_amanhecerFim - t1_amanhecerIni) * 60L; 
     indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 0, 255);
   }
-  // 2. 04:30 as 08:00 (Fixo 100%)
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     indiceLinearPWM = 255;
   }
-  // 3. 08:00 as 16:00 (LDR Ativo OU Fixo 0%)
   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
       static float pwmIntegrativo = 255; 
       static unsigned long tempoUltimaAcao = millis();
 
-      const int ALVO_LDR = 400;   // Ajuste do alvo no trimpot
+      const int ALVO_LDR = 400;   
       const int JANELA = 80;      
 
       if (millis() - tempoUltimaAcao >= 100) { 
         int leituraLDR = analogRead(PINO_LDR);
         
-        // Montagem: LDR(5V) e Trimpot(GND). 
-        // Escuro = leituraLDR BAIXA / Claro = leituraLDR ALTA
-        if (leituraLDR < (ALVO_LDR - JANELA)) {
-          pwmIntegrativo += 0.5; // Escureceu, aumenta a luz
-        } 
-        else if (leituraLDR > (ALVO_LDR + JANELA)) {
-          pwmIntegrativo -= 0.5; // Clareou, diminui a luz
-        }
+        if (leituraLDR < (ALVO_LDR - JANELA)) pwmIntegrativo += 0.5; 
+        else if (leituraLDR > (ALVO_LDR + JANELA)) pwmIntegrativo -= 0.5; 
 
         if (pwmIntegrativo > 255) pwmIntegrativo = 255;
         if (pwmIntegrativo < 0) pwmIntegrativo = 0;
@@ -283,21 +274,17 @@ void controlarLuz() {
       indiceLinearPWM = (int)pwmIntegrativo;
     } 
     else {
-      // Se o LDR foi desativado pelo usuario, a luz fica em 0 (Desligada)
       indiceLinearPWM = 0; 
     }
   }
-  // 4. 16:00 as 20:00 (Fixo 100% independente do LDR)
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
     indiceLinearPWM = 255;
   }
-  // 5. 20:00 as 20:30 (Anoitecer)
   else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
     long segundosPassados = segundosDoDia - (t5_anoitecerIni * 60L);
     long segundosTotaisRampa = (t6_anoitecerFim - t5_anoitecerIni) * 60L;
     indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 255, 0); 
   }
-  // 6. 20:30 as 04:00 (Madrugada - Tudo desligado)
   else {
     indiceLinearPWM = 0;
   }
@@ -331,8 +318,20 @@ void atualizarBarraLEDsCFTV() {
   int dist = lerUltrassonicoEstavel();
   porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
   porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
+  
+  // Converte a porcentagem d'água no preenchimento da Barra de LEDs
+  byte estadoLeds = 0;
+  if (porcentagemAguaGlobal > 10) estadoLeds |= 0b00000001; 
+  if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000011;
+  if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000111;
+  if (porcentagemAguaGlobal > 45) estadoLeds |= 0b00001111;
+  if (porcentagemAguaGlobal > 60) estadoLeds |= 0b00011111;
+  if (porcentagemAguaGlobal > 75) estadoLeds |= 0b00111111;
+  if (porcentagemAguaGlobal > 85) estadoLeds |= 0b01111111;
+  if (porcentagemAguaGlobal > 95) estadoLeds |= 0b11111111;
+
   Wire.beginTransmission(ENDERECO_PCF_LEDS);
-  Wire.write(0xFF); 
+  Wire.write(estadoLeds); 
   Wire.endTransmission();
 }
 
@@ -390,7 +389,7 @@ void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
 void gerenciarMenuAjuste() {
   static unsigned long tempoInicioSegurarMenu = 0;
   static bool salvamentoExecutado = false;
-  static bool ignorarSoltura = false; // Flag de escudo
+  static bool ignorarSoltura = false; 
 
   if (modoMenu == 0) {
     if (menuPressionado == LOW) {
@@ -401,7 +400,7 @@ void gerenciarMenuAjuste() {
         horaAjuste = agora.hour();
         minutoAjuste = agora.minute();
         tempoInicioSegurarMenu = 0;
-        ignorarSoltura = true; // Avisa o sistema para ignorar quando soltar o botão
+        ignorarSoltura = true; 
       }
     } else {
       tempoInicioSegurarMenu = 0;
@@ -422,7 +421,6 @@ void gerenciarMenuAjuste() {
     if (menuPressionado == LOW) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       
-      // Salvamento rápido, zera o cronômetro antes de sair
       if ((millis() - tempoInicioSegurarMenu) > 1000 && !salvamentoExecutado && !ignorarSoltura) {
         salvamentoExecutado = true; 
         
@@ -441,16 +439,15 @@ void gerenciarMenuAjuste() {
         delay(3000);
         
         modoMenu = 0;
-        tempoInicioSegurarMenu = 0; // Zera o cronômetro
-        menuFoiClicado = false;     // Limpa o buffer do botão
+        tempoInicioSegurarMenu = 0; 
+        menuFoiClicado = false;     
         lcd.clear();
-        return;                     // Sai da função
+        return;                     
       }
     } 
     else { 
-      // --- BOTÃO FOI SOLTO ---
       if (ignorarSoltura) {
-        ignorarSoltura = false; // Apenas desativa o escudo e não faz nada
+        ignorarSoltura = false; 
       } 
       else if (tempoInicioSegurarMenu > 0) {
         unsigned long duracao = millis() - tempoInicioSegurarMenu;
@@ -559,7 +556,6 @@ void telaPrincipal() {
   if(estadoLuz) lcd.print("ON ");
   else lcd.print("OFF");
 
-// Painel dinâmico da segunda linha
   lcd.setCursor(0, 1);
   long minutosAtuais = agora.hour() * 60 + agora.minute();
 
@@ -608,8 +604,7 @@ void telaNivelGama() {
   if (percLuz < 100) lcd.print(" "); 
   if (percLuz < 10) lcd.print(" ");  
   lcd.print(percLuz);
-  lcd.print("% ");
+  lcd.print("% (");
   lcd.print(pwmAtualGlobal);
-  lcd.print("  "); 
+  lcd.print(")  "); 
 }
-
