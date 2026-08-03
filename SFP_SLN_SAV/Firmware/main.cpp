@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 7.1
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 7.2
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -49,7 +49,6 @@ const uint8_t gamma8[] PROGMEM = {
   177,180,182,184,186,189,191,193,196,198,200,203,205,208,210,213,
   215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
 };
-
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
@@ -63,6 +62,12 @@ int porcentagemAguaGlobal = 0;
 int pwmAtualGlobal = 0; 
 bool estadoLuz = false;
 bool valvulaLigada = false;
+
+// --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
+unsigned long tempoBombaLigada = 0;
+const unsigned long TEMPO_MAXIMO_BOMBA = 60000; // 15 minutos em milissegundos (ajuste se precisar)
+bool erroBombaTravada = false; // FLAG DE ERRO
+
 
 // Variáveis: LDR Manual Override
 bool sensorLuzAtivo = true; 
@@ -164,7 +169,7 @@ void loop() {
     } 
     else if (millis() - tempoBotoesPressione >= 1000) {
       sensorLuzAtivo = !sensorLuzAtivo; 
-      EEPROM.write(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
+      EEPROM.update(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
       
       lcd.clear();
       lcd.backlight();
@@ -187,8 +192,28 @@ void loop() {
   processarDebounceBotoes();
   gerenciarMenuAjuste();
 
-  // --- MÁQUINA DE ESTADOS DO DISPLAY ---
-  if (modoMenu > 0) {
+  // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
+  static unsigned long tempoSegurandoUP = 0;
+
+  if (erroBombaTravada) {
+    telaErroBomba();
+    
+    // Lógica para rearmar segurando o botão UP por 5 segundos
+    if (digitalRead(BTN_UP) == LOW) {
+      if (tempoSegurandoUP == 0) tempoSegurandoUP = millis();
+      if (millis() - tempoSegurandoUP >= 5000) {
+        erroBombaTravada = false; // Destrava o sistema
+        tempoSegurandoUP = 0;
+        lcd.clear();
+        lcd.print(" BOMBA REARMADA ");
+        delay(2000);
+        lcd.clear();
+      }
+    } else {
+      tempoSegurandoUP = 0; // Zera o cronômetro se soltar o dedo antes
+    }
+  } 
+  else if (modoMenu > 0) {
     telaAjusteHora(); 
   } 
   else {
@@ -215,7 +240,7 @@ void loop() {
   }
 
   // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
-  if (millis() - ultimoCicloUltrassom >= 5000) {
+  if (millis() - ultimoCicloUltrassom >= 5000) { 
     ultimoCicloUltrassom = millis(); 
     
     atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
@@ -225,16 +250,22 @@ void loop() {
     }
   }
 }
-
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
 void controlarNivelAgua() {
   if (porcentagemAguaGlobal <= 10 && !valvulaLigada) {
-    valvulaLigada = true;
-    digitalWrite(PINO_VALVULA, HIGH); 
+    valvulaLigada = true; 
+    tempoBombaLigada = millis(); // Marca a hora exata da partida
+    digitalWrite(PINO_VALVULA, HIGH);
   } 
   else if (porcentagemAguaGlobal >= 100 && valvulaLigada) {
     valvulaLigada = false;
     digitalWrite(PINO_VALVULA, LOW);  
+  }
+  // FAIL-SAFE: Desliga na marra se estourar o tempo limite (ex: cano quebrado ou sensor sujo)
+  if (valvulaLigada && (millis() - tempoBombaLigada > TEMPO_MAXIMO_BOMBA)) {
+    valvulaLigada = false;
+    digitalWrite(PINO_VALVULA, LOW);
+    erroBombaTravada = true; // Aciona o estado de falha global
   }
 }
 
@@ -321,14 +352,14 @@ void atualizarBarraLEDsCFTV() {
   
   // Converte a porcentagem d'água no preenchimento da Barra de LEDs
   byte estadoLeds = 0;
-  if (porcentagemAguaGlobal > 10) estadoLeds |= 0b00000001; 
-  if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000011;
-  if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000111;
-  if (porcentagemAguaGlobal > 45) estadoLeds |= 0b00001111;
+  if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000001; 
+  if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000011;
+  if (porcentagemAguaGlobal > 40) estadoLeds |= 0b00000111;
+  if (porcentagemAguaGlobal > 50) estadoLeds |= 0b00001111;
   if (porcentagemAguaGlobal > 60) estadoLeds |= 0b00011111;
-  if (porcentagemAguaGlobal > 75) estadoLeds |= 0b00111111;
-  if (porcentagemAguaGlobal > 85) estadoLeds |= 0b01111111;
-  if (porcentagemAguaGlobal > 95) estadoLeds |= 0b11111111;
+  if (porcentagemAguaGlobal > 70) estadoLeds |= 0b00111111;
+  if (porcentagemAguaGlobal > 80) estadoLeds |= 0b01111111;
+  if (porcentagemAguaGlobal > 90) estadoLeds |= 0b11111111;
 
   Wire.beginTransmission(ENDERECO_PCF_LEDS);
   Wire.write(estadoLeds); 
@@ -594,6 +625,20 @@ void telaNivelAgua() {
   lcd.print("%          "); 
 }
 
+void telaErroBomba() {
+  lcd.setCursor(0, 0);
+  bool pisca = ((millis() / 500) % 2 == 0);
+  
+  if (pisca) {
+    lcd.print("ALERTA: CANO SECO!");
+  } else {
+    lcd.print(" BOMBA DESLIGADA  ");
+  }
+  
+  lcd.setCursor(0, 1);
+  lcd.print("SEGURE UP (5s)  ");
+}
+
 void telaNivelGama() {
   lcd.setCursor(0, 0);
   lcd.print(" NIVEL DE LUZ:  "); 
@@ -608,3 +653,4 @@ void telaNivelGama() {
   lcd.print(pwmAtualGlobal);
   lcd.print(")  "); 
 }
+
