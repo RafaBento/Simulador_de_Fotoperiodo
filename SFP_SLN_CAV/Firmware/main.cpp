@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 4.0
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 5.0
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de vazamento por taxa de variação de nível, sem sensor de fluxo.
  */
@@ -50,6 +50,7 @@ const uint8_t gamma8[] PROGMEM = {
   215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
 };
 
+
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
@@ -63,6 +64,11 @@ int porcentagemAguaGlobal = 0;
 int pwmAtualGlobal = 0; // Armazena o valor do Gama atual (0 a 255)
 bool vazamentoDetectado = false;
 bool estadoLuz = false;
+
+// Variáveis LDR Manual Override
+bool sensorLuzAtivo = true; 
+unsigned long tempoBotoesPressione = 0;
+bool comboPressionado = false;
 
 // Variáveis para as Telas "Pop-up" Temporárias (3 segundos)
 byte telaTemporariaAtiva = 0; // 0=Nenhuma, 1=Água, 2=Gama
@@ -116,7 +122,7 @@ void setup() {
     lcd.print("Erro no RTC!");
     while (1); 
   }
-  
+
   // COMENTAR ESTA LINHA APÓS O PRIMEIRO UPLOAD
    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
@@ -126,7 +132,6 @@ void setup() {
     delay(2000);
     lcd.clear();
   }
-
   // --- INICIALIZAÇÃO DA EEPROM ---
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
@@ -137,9 +142,9 @@ void setup() {
     EEPROM.put(7, t4_tarde100);
     EEPROM.put(9, t5_anoitecerIni);
     EEPROM.put(11, t6_anoitecerFim);
-    EEPROM.write(0, EEPROM_INIT_CODE); // Sela a formatação
+    EEPROM.write(0, EEPROM_INIT_CODE); // Salva a formatação
   } else {
-    // Já foi formatado. Lê as configurações salvas do usuário
+    // Já formatado. Lê as configurações salvas do usuário
     EEPROM.get(1, t1_amanhecerIni);
     EEPROM.get(3, t2_amanhecerFim);
     EEPROM.get(5, t3_diaProporcional);
@@ -170,11 +175,45 @@ void setup() {
 void loop() {
   wdt_reset(); // Reinicia o Watchdog
   
-  if (modoMenu == 0) {
-    agora = rtc.now(); // Só lê o RTC se não estiver no menu de ajuste (pra não mudar a hora durante o ajuste)
+  if (modoMenu == 0) agora = rtc.now(); 
+
+  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ (UP + DOWN por 1s) ---
+  bool btnUpCru = (digitalRead(BTN_UP) == LOW);
+  bool btnDownCru = (digitalRead(BTN_DOWN) == LOW);
+
+  if (btnUpCru && btnDownCru && modoMenu == 0 && !vazamentoDetectado) {
+    if (!comboPressionado) {
+      comboPressionado = true;
+      tempoBotoesPressione = millis();
+    } 
+    else if (millis() - tempoBotoesPressione >= 1000) {
+      sensorLuzAtivo = !sensorLuzAtivo; // Inverte o status do LDR
+      
+      lcd.clear();
+      lcd.backlight();
+      if (sensorLuzAtivo) {
+        lcd.print("SENSOR DE LUZ ON"); 
+      } else {
+        lcd.print("SENSOR DE LUZ OF"); 
+      }
+      
+      delay(2000); 
+      lcd.clear();
+      
+      // Trava de segurança: Espera que os botões sejam soltos
+      while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW) {
+        wdt_reset(); // Alimenta o Watchdog pra a placa não resetar
+        delay(10);
+      }
+      comboPressionado = false; 
+    }
+  } else {
+    comboPressionado = false; 
   }
-  
-  // 1. Processa Debounce de todos os botões
+
+  // ------------------------------------------------------------------------
+
+   // 1. Processa Debounce de todos os botões
   processarDebounceBotoes();
   
   // 2. Processa Lógica do Menu baseada nos cliques estáveis
@@ -182,24 +221,23 @@ void loop() {
 
   // --- MÁQUINA DE ESTADOS DO DISPLAY ---
   if (modoMenu > 0) {
-         telaAjusteHora(); // Tela de Menu tem prioridade
+    telaAjusteHora(); // Tela de Menu tem prioridade
   } else if (vazamentoDetectado) {
-         telaAlarme();      // Alarme tem segunda prioridade
+    telaAlarme();      // Alarme tem segunda prioridade
   } else {
     // Telas temporárias de 3 segundos
     if (telaTemporariaAtiva > 0) {
       if (millis() - tempoExibicaoTela > 3000) {
-         telaTemporariaAtiva = 0; // Acabou o tempo
-         lcd.clear(); // Limpa a tela para o relógio entrar limpo
+        telaTemporariaAtiva = 0; // Acabou o tempo
+        lcd.clear(); // Limpa a tela para o relógio entrar limpo
       } else {
         if (telaTemporariaAtiva == 1) telaNivelAgua();
         else if (telaTemporariaAtiva == 2) telaNivelGama();
       }
     } else {
-         telaPrincipal(); 
+      telaPrincipal(); 
     }
   }
-
   if (millis() - ultimoCiclo > 1000) {
     ultimoCiclo = millis();
     
@@ -212,6 +250,7 @@ void loop() {
     atualizarBarraLEDsCFTV(); 
   }
 
+  // A verificação de vazamento roda a cada 10 segundos
   if (modoMenu == 0 && (millis() - ultimoTesteVazamento > 10000)) { 
     verificarVazamento();
     ultimoTesteVazamento = millis();
@@ -233,14 +272,53 @@ void controlarLuz() {
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     indiceLinearPWM = 255;
   }
+  
+  // 3. HORÁRIO COMERCIAL (Controle LDR ou 100% Manual)
   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
-    int leituraLDR = analogRead(PINO_LDR);
-    // CALIBRAÇÃO DO LDR: ajustar estes valores dependendo se a resistência do sensor aumenta ou diminui no escuro
-    const int LDR_ESCURO = 200; 
-    const int LDR_CLARO  = 800; 
-    int pwmProporcional = map(leituraLDR, LDR_ESCURO, LDR_CLARO, 255, 0);
-    indiceLinearPWM = constrain(pwmProporcional, 0, 255);
+    
+    if (sensorLuzAtivo) {
+      // --- LÓGICA INTEGRATIVA LENTA (Média de 5 Segundos) ---
+      static int pwmIntegrativo = 0; 
+      static unsigned long somaLDR = 0;
+      static int contadorLeituras = 0;
+      static unsigned long tempoUltimaAcao = millis();
+
+      // Ajustes finos do ambiente
+      const int ALVO_LDR = 400;   // Para o nível de iluminação desejado
+      const int JANELA = 100;     // Tolerância "Deadband"
+
+      somaLDR += analogRead(PINO_LDR);
+      contadorLeituras++;
+
+      if (millis() - tempoUltimaAcao >= 5000) {
+        if (contadorLeituras > 0) { 
+          int mediaLDR = somaLDR / contadorLeituras; 
+          
+          // Se o LDR ler valores menores no escuro (Padrão Pull-Down), basta manter assim.
+          // Se o  LDR for Pull-Up (valores maiores no escuro), deve-se inverter os sinais de < e >.
+
+          if (mediaLDR < (ALVO_LDR - JANELA)) {
+            pwmIntegrativo++; // Escureceu, sobe 1 degrau
+          } 
+          else if (mediaLDR > (ALVO_LDR + JANELA)) {
+            pwmIntegrativo--; // Clareou muito, desce 1 degrau
+          }
+
+          pwmIntegrativo = constrain(pwmIntegrativo, 0, 255);
+        }
+        
+        somaLDR = 0;
+        contadorLeituras = 0;
+        tempoUltimaAcao = millis();
+      }
+      indiceLinearPWM = pwmIntegrativo;
+    } 
+    else {
+      // LDR Desligado pelo usuário: forçar luz máxima no horário comercial
+      indiceLinearPWM = 255; 
+    }
   }
+  
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
     indiceLinearPWM = 255;
   }
@@ -254,15 +332,15 @@ void controlarLuz() {
   }
 
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-  
+
   // Salva o valor atual na variável Global para o Visor ler
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
-  
+
   analogWrite(PINO_DIMMER, pwmAtualGlobal);
   estadoLuz = (pwmAtualGlobal > 0);
 }
 
-// --- ROTINAS DE HARDWARE E SENSORES ---
+// --- HARDWARE E SENSORES ---
 int lerUltrassonicoEstavel() {
   long soma = 0;
   for(int i=0; i<3; i++) {
@@ -295,6 +373,7 @@ void verificarVazamento() {
     distanciaAnterior = distanciaAtual;      // Atualiza referência se variação normal
   }
 }
+
 
 // --- BOTÕES E MENU INTELIGENTE ---
 void processarDebounceBotoes() {
@@ -354,10 +433,9 @@ void processarDebounceBotoes() {
   ultimoEstadoCruDOWN = leituraAtualDOWN;
 }
 
-// Função utilitária para ajustar as variáveis de tempo (em passos de 5 min) para horarios dos periodos
 void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
-  if (aumenta) variavelTempo += 5;
-  else variavelTempo -= 5;
+  if (aumenta) variavelTempo += 15;
+  else variavelTempo -= 15;
   if (variavelTempo > 1439) variavelTempo = 0;
   if (variavelTempo < 0) variavelTempo = 1425;
 }
@@ -367,9 +445,9 @@ void gerenciarMenuAjuste() {
 
   // Lógica para Resetar Alarme (Segurar MENU por 3 segundos pós-debounce)
   static unsigned long tempoInicioSegurarMenu = 0;
-
+ 
   if (vazamentoDetectado) {
-    if (menuPressionado == LOW) {    // Segurando estabilizado
+    if (menuPressionado == LOW) {   // Segurando estabilizado
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 3000) {
         // RESETAR ALARME E VÁLVULA
@@ -377,6 +455,7 @@ void gerenciarMenuAjuste() {
         digitalWrite(PINO_VALVULA, LOW); // Volta a desligar a válvula
         distanciaAnterior = lerUltrassonicoEstavel(); 
         lcd.clear();
+        lcd.backlight();
         lcd.print("ALARME RESETADO");
         delay(1000);
         lcd.clear();
@@ -406,13 +485,13 @@ void gerenciarMenuAjuste() {
       tempoInicioSegurarMenu = 0;
     }
 
-    // GATILHOS DAS TELAS TEMPORÁRIAS (Apenas 1 clique)
-    if (upFoiClicado) {
+    // Só exibe as telas rápidas se não estiver segurando o combo LDR (UP+DOWN)
+    if (upFoiClicado && !comboPressionado) {
       telaTemporariaAtiva = 1; // Tela Água
       tempoExibicaoTela = millis();
       lcd.clear();
     }
-    if (downFoiClicado) {
+    if (downFoiClicado && !comboPressionado) {
       telaTemporariaAtiva = 2; // Tela Gama
       tempoExibicaoTela = millis();
       lcd.clear();
@@ -440,7 +519,6 @@ void gerenciarMenuAjuste() {
         lcd.clear();
       }
     }
-
   // --- NAVEGAÇÃO DOS 8 ESTADOS DO MENU ---
   if (modoMenu == 1) { 
     if (upFoiClicado) { horaAjuste++; if(horaAjuste > 23) horaAjuste = 0; }
@@ -469,6 +547,7 @@ void gerenciarMenuAjuste() {
   }
 }
 }
+
 // --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
 
 // Função utilitária para desenhar HH:MM a partir de minutos totais
@@ -481,6 +560,7 @@ void printHoraFormatada(int minutosTotais) {
   if(m < 10) lcd.print('0');
   lcd.print(m);
 }
+
 
 void telaAjusteHora() {
   lcd.backlight(); 
@@ -531,7 +611,6 @@ void atualizarBarraLEDsCFTV() {
   Wire.endTransmission();
 }
 
-
 void telaPrincipal() {
   lcd.setCursor(0, 0);
   if(agora.hour() < 10) lcd.print('0');
@@ -550,7 +629,8 @@ void telaPrincipal() {
   else lcd.print("OFF");
 
   lcd.setCursor(0, 1);
-  lcd.print("Status: OK      "); 
+  if (sensorLuzAtivo) lcd.print("Status: OK      ");
+  else lcd.print("Status: LDR OFF "); // Pequeno lembrete na tela inicial!
 }
 
 void telaNivelAgua() {
@@ -581,12 +661,12 @@ void telaNivelGama() {
   lcd.print(")  "); 
 }
 
+
 void telaAlarme() {
   lcd.setCursor(0, 0);
-  lcd.print("! ALARME VAZTO !"); // 16 caracteres
+  lcd.print("!  VAZAMENTO  ! "); // 16 caracteres
   lcd.setCursor(0, 1);
   lcd.print("VALVULA FECHADA "); // 16 caracteres
-  
   // Pisca Backlight usando millis
   if ((millis() / 500) % 2 == 0) lcd.noBacklight();
   else lcd.backlight();
