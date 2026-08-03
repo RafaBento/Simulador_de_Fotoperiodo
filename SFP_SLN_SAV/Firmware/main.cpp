@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 7.2
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.0
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -49,6 +49,7 @@ const uint8_t gamma8[] PROGMEM = {
   177,180,182,184,186,189,191,193,196,198,200,203,205,208,210,213,
   215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
 };
+
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
@@ -65,7 +66,7 @@ bool valvulaLigada = false;
 
 // --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
 unsigned long tempoBombaLigada = 0;
-const unsigned long TEMPO_MAXIMO_BOMBA = 60000; // 15 minutos em milissegundos (ajuste se precisar)
+const unsigned long TEMPO_MAXIMO_BOMBA = 600000; // 10 minutos em milissegundos (ajustar em campo)
 bool erroBombaTravada = false; // FLAG DE ERRO
 
 
@@ -96,7 +97,7 @@ bool downFoiClicado = false;
 int modoMenu = 0; 
 int horaAjuste, minutoAjuste;
 
-byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00};
+byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; //apenas para enfeite no display
 
 void setup() {
   pinMode(PINO_DIMMER, OUTPUT);
@@ -158,7 +159,7 @@ void loop() {
   
   if (modoMenu == 0) agora = rtc.now(); 
 
-  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ ---
+  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ (LDR) ---
   bool btnUpCru = (digitalRead(BTN_UP) == LOW);
   bool btnDownCru = (digitalRead(BTN_DOWN) == LOW);
 
@@ -218,7 +219,7 @@ void loop() {
   } 
   else {
     if (telaTemporariaAtiva > 0) {
-      if (millis() - tempoExibicaoTela > 1000) {
+      if (millis() - tempoExibicaoTela > 3000) {
         telaTemporariaAtiva = 0; 
         lcd.clear(); 
       } else {
@@ -250,6 +251,7 @@ void loop() {
     }
   }
 }
+
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
 void controlarNivelAgua() {
   if (porcentagemAguaGlobal <= 10 && !valvulaLigada) {
@@ -350,7 +352,7 @@ void atualizarBarraLEDsCFTV() {
   porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
   porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
   
-  // Converte a porcentagem d'água no preenchimento da Barra de LEDs
+  // Converte a porcentagem da água no preenchimento da Barra de LEDs
   byte estadoLeds = 0;
   if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000001; 
   if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000011;
@@ -362,7 +364,7 @@ void atualizarBarraLEDsCFTV() {
   if (porcentagemAguaGlobal > 90) estadoLeds |= 0b11111111;
 
   Wire.beginTransmission(ENDERECO_PCF_LEDS);
-  Wire.write(estadoLeds); 
+  Wire.write(~estadoLeds); 
   Wire.endTransmission();
 }
 
@@ -467,7 +469,7 @@ void gerenciarMenuAjuste() {
         lcd.print("ALTERACAO  SALVA");
         lcd.setCursor(0, 1);
         lcd.print("  COM SUCESSO!  :)");
-        delay(3000);
+        delay(2000);
         
         modoMenu = 0;
         tempoInicioSegurarMenu = 0; 
@@ -497,7 +499,7 @@ void gerenciarMenuAjuste() {
             lcd.print("SUAS ALTERACOES ");
             lcd.setCursor(0, 1);
             lcd.print("FORAM SALVAS! :)");
-            delay(3000);
+            delay(2000);
             lcd.clear();
           }
         }
@@ -627,12 +629,12 @@ void telaNivelAgua() {
 
 void telaErroBomba() {
   lcd.setCursor(0, 0);
-  bool pisca = ((millis() / 500) % 2 == 0);
+  bool pisca = ((millis() / 2000) % 2 == 0);
   
   if (pisca) {
-    lcd.print("ALERTA: CANO SECO!");
+    lcd.print("TEMPO EXCEDIDO!!");
   } else {
-    lcd.print(" BOMBA DESLIGADA  ");
+    lcd.print("BOMBA DESLIGADA!");
   }
   
   lcd.setCursor(0, 1);
@@ -653,4 +655,3 @@ void telaNivelGama() {
   lcd.print(pwmAtualGlobal);
   lcd.print(")  "); 
 }
-
