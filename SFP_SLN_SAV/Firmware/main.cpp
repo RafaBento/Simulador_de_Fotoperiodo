@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.2
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.3
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -432,6 +432,7 @@ void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
 }
 
 void gerenciarMenuAjuste() {
+  if (erroBombaTravada) return; // Bloqueia a lógica invisível de ajuste, sai da funcao de ajuste se a bomba travar por estouro de tempo
   static unsigned long tempoInicioSegurarMenu = 0;
   static bool salvamentoExecutado = false;
   static bool ignorarSoltura = false; 
