@@ -1,6 +1,6 @@
-/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 5.0
- * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
- * Detecção de vazamento por taxa de variação de nível, sem sensor de fluxo.
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 6.0
+ * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, YF-S201, Relé, IRF3205.
+ * Detecção de vazamento através de sensor de fluxo.
  */
 
 #include <Wire.h>
@@ -10,22 +10,27 @@
 #include <EEPROM.h>  // Memória Não Volátil
 
 // --- MAPEAMENTO DE PINOS ---
-#define PINO_LDR        A0 // Pino para o LDR
-#define BTN_MENU        A1 // Botão menu
-#define BTN_UP          A2 // Botão UP 
-#define BTN_DOWN        A3 // Botão DOWN
-#define PINO_DIMMER     3  // Pino do PWM
-#define PINO_VALVULA    9  // Pino de ligar a válvula solenóide tipo NA
-#define PINO_TRIGGER    10 // Pino do Sensor de Nível
-#define PINO_ECHO       11 // Pinno do sensor de nível
+#define PINO_SENSOR_FLUXO   2   // Fio amarelo do YF-S201 (Obrigatório ser pino 2 ou 3 para interrupção)
+#define PINO_LDR           A0    // Pino para o LDR
+#define BTN_MENU           A1    // Botão menu
+#define BTN_UP             A2    // Botão UP 
+#define BTN_DOWN           A3    // Botão DOWN
+#define PINO_DIMMER         3     // Pino do PWM
+#define PINO_VALVULA        9     // Pino de ligar a válvula solenóide tippo NA
+#define PINO_TRIGGER       10    // Pino do Sensor de Nível
+#define PINO_ECHO          11    // Pinno do sensor de nível
 
 // Endereço I2C do Módulo PCF8574 extra para LEDs
 #define ENDERECO_PCF_LEDS 0x26 
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
-const int DISTANCIA_TANQUE_VAZIO = 100; // cm
-const int DISTANCIA_TANQUE_CHEIO = 10;  // cm
-const int LIMITE_QUEDA_VAZAMENTO = 10;   
+const int DISTANCIA_TANQUE_VAZIO = 100; // cm (Ajustar em campo)
+const int DISTANCIA_TANQUE_CHEIO = 10;  // cm (Ajustar em campo)
+
+// Limite de pulsos do Sensor de Fluxo a cada 10 segundos para considerar vazamento
+// O YF-S201 gera aprox. 450 pulsos por litro. O valor abaixo deve ser ajustado na prática
+const int LIMITE_PULSOS_VAZAMENTO = 50; 
+
 const unsigned long tempoDebounce = 50; 
 
 #define EEPROM_INIT_CODE 0x42 
@@ -50,7 +55,6 @@ const uint8_t gamma8[] PROGMEM = {
   215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
 };
 
-
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
@@ -59,11 +63,13 @@ RTC_DS3231 rtc;
 DateTime agora;
 unsigned long ultimoCiclo = 0;
 unsigned long ultimoTesteVazamento = 0;
-int distanciaAnterior = 0;
 int porcentagemAguaGlobal = 0; 
-int pwmAtualGlobal = 0; // Armazena o valor do Gama atual (0 a 255)
+int pwmAtualGlobal = 0;                   // Armazena o valor do Gama atual (0 a 255)
 bool vazamentoDetectado = false;
 bool estadoLuz = false;
+
+// Contador de pulsos do sensor de fluxo (volatile porque roda na interrupção)
+volatile unsigned int contadorPulsosFluxo = 0;
 
 // Variáveis LDR Manual Override
 bool sensorLuzAtivo = true; 
@@ -82,7 +88,6 @@ int t4_tarde100 = 960;       // 16:00 Padrão
 int t5_anoitecerIni = 1200;  // 20:00 Padrão
 int t6_anoitecerFim = 1230;  // 20:30 Padrão 
 
-
 // Estados estabilizados dos botões (pós-debounce)
 bool menuPressionado = false;
 bool upPressionado = false;
@@ -100,12 +105,21 @@ int horaAjuste, minutoAjuste;
 // Ícone de Gota
 byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00};
 
+// --- FUNÇÃO DE INTERRUPÇÃO DO SENSOR DE FLUXO ---
+void contarPulsos() {
+  contadorPulsosFluxo++;
+}
+
 void setup() {
   // Configura Pinos Sensores/Atuadores
   pinMode(PINO_DIMMER, OUTPUT);
   pinMode(PINO_VALVULA, OUTPUT);
   pinMode(PINO_TRIGGER, OUTPUT);
   pinMode(PINO_ECHO, INPUT);
+  
+  // Configura o sensor de fluxo e atrela a interrupção
+  pinMode(PINO_SENSOR_FLUXO, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PINO_SENSOR_FLUXO), contarPulsos, FALLING);
   
   // Botões com Pull-Up Interno
   pinMode(BTN_MENU, INPUT_PULLUP);
@@ -122,9 +136,8 @@ void setup() {
     lcd.print("Erro no RTC!");
     while (1); 
   }
-
-  // COMENTAR ESTA LINHA APÓS O PRIMEIRO UPLOAD
-   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // COMENTAR A LINHA ABAIXO APÓS O PRIMEIRO UPLOAD
+  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
   // SE O RTC PERDEU A HORA (Bateria acabou)
   if (rtc.lostPower()) {
@@ -132,9 +145,11 @@ void setup() {
     delay(2000);
     lcd.clear();
   }
-  // --- INICIALIZAÇÃO DA EEPROM ---
+
+  // Inicialização EEPROM
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
+
     // É a primeira vez. Grava os padrões na EEPROM
     EEPROM.put(1, t1_amanhecerIni);
     EEPROM.put(3, t2_amanhecerFim);
@@ -142,6 +157,7 @@ void setup() {
     EEPROM.put(7, t4_tarde100);
     EEPROM.put(9, t5_anoitecerIni);
     EEPROM.put(11, t6_anoitecerFim);
+
     EEPROM.write(0, EEPROM_INIT_CODE); // Salva a formatação
   } else {
     // Já formatado. Lê as configurações salvas do usuário
@@ -159,10 +175,7 @@ void setup() {
   vazamentoDetectado = false;
 
   analogWrite(PINO_DIMMER, 0);    // Luz Apagada 
-  
-  // Leitura inicial estabilizada
-  distanciaAnterior = lerUltrassonicoEstavel();
-  
+
   lcd.setCursor(0,0);
   lcd.print("SISTEMA INICIADO");
   delay(1000);
@@ -170,7 +183,6 @@ void setup() {
 
   wdt_enable(WDTO_8S);   // Ativa o Watchdog para 8 segundos
 }
-
 
 void loop() {
   wdt_reset(); // Reinicia o Watchdog
@@ -238,6 +250,8 @@ void loop() {
       telaPrincipal(); 
     }
   }
+
+  // --- CICLO PRINCIPAL (1 Segundo) ---
   if (millis() - ultimoCiclo > 1000) {
     ultimoCiclo = millis();
     
@@ -247,13 +261,30 @@ void loop() {
         digitalWrite(PINO_VALVULA, LOW); 
       }
     }
-    atualizarBarraLEDsCFTV(); 
+    atualizarBarraLEDsCFTV(); // Lê o ultrassônico e calcula porcentagemAguaGlobal
   }
 
   // A verificação de vazamento roda a cada 10 segundos
   if (modoMenu == 0 && (millis() - ultimoTesteVazamento > 10000)) { 
     verificarVazamento();
     ultimoTesteVazamento = millis();
+  }
+}
+
+// --- FUNÇÃO DE VAZAMENTO USANDO YF-S201 ---
+void verificarVazamento() {
+  if (vazamentoDetectado) return; 
+
+  // Desliga interrupções rapidamente apenas para ler e zerar a variável global com segurança
+  noInterrupts();
+  unsigned int pulsosAtuais = contadorPulsosFluxo;
+  contadorPulsosFluxo = 0;
+  interrupts();
+
+  // Se o número de giros da hélice nos últimos 10 segundos passar do limite
+  if (pulsosAtuais > LIMITE_PULSOS_VAZAMENTO) {
+    vazamentoDetectado = true;
+    digitalWrite(PINO_VALVULA, HIGH); // Aciona o relé para ligar a válvula e fechar a passagem da água
   }
 }
 
@@ -284,7 +315,7 @@ void controlarLuz() {
       static unsigned long tempoUltimaAcao = millis();
 
       // Ajustes finos do ambiente
-      const int ALVO_LDR = 400;   // Para o nível de iluminação desejado
+      const int ALVO_LDR = 400;   // A luz perfeita no chão
       const int JANELA = 100;     // Tolerância "Deadband"
 
       somaLDR += analogRead(PINO_LDR);
@@ -293,7 +324,7 @@ void controlarLuz() {
       if (millis() - tempoUltimaAcao >= 5000) {
         if (contadorLeituras > 0) { 
           int mediaLDR = somaLDR / contadorLeituras; 
-          
+
           // Se o LDR ler valores menores no escuro (Padrão Pull-Down), basta manter assim.
           // Se o  LDR for Pull-Up (valores maiores no escuro), deve-se inverter os sinais de < e >.
 
@@ -314,8 +345,8 @@ void controlarLuz() {
       indiceLinearPWM = pwmIntegrativo;
     } 
     else {
-      // LDR Desligado pelo usuário: forçar luz máxima no horário comercial
-      indiceLinearPWM = 255; 
+      // LDR Desligado pelo usuário: forçar luz mínima no horário comercial
+      indiceLinearPWM = 0; 
     }
   }
   
@@ -332,7 +363,7 @@ void controlarLuz() {
   }
 
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-
+  
   // Salva o valor atual na variável Global para o Visor ler
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
 
@@ -359,29 +390,13 @@ int lerUltrassonicoEstavel() {
   return soma / 3;
 }
 
-void verificarVazamento() {
-  if (vazamentoDetectado) return; 
-
-  int distanciaAtual = lerUltrassonicoEstavel();
-  int diferenca = distanciaAtual - distanciaAnterior;
-
-  if (diferenca > LIMITE_QUEDA_VAZAMENTO) {  // Se a água desceu (distância aumentou) mais que o limite
-    vazamentoDetectado = true;
-
-    digitalWrite(PINO_VALVULA, HIGH);         // Liga a válvula
-  } else {
-    distanciaAnterior = distanciaAtual;      // Atualiza referência se variação normal
-  }
-}
-
-
 // --- BOTÕES E MENU INTELIGENTE ---
 void processarDebounceBotoes() {
   // Variáveis estáticas para guardar estado entre execuções do loop
   static unsigned long tempoUltimaMudancaMENU = 0;
   static unsigned long tempoUltimaMudancaUP = 0;
   static unsigned long tempoUltimaMudancaDOWN = 0;
-  
+
   static bool ultimoEstadoCruMENU = HIGH;
   static bool ultimoEstadoCruUP = HIGH;
   static bool ultimoEstadoCruDOWN = HIGH;
@@ -391,7 +406,7 @@ void processarDebounceBotoes() {
   upFoiClicado = false;
   downFoiClicado = false;
 
-  // --- DEBOUNCE BOTÃO MENU ---
+// --- DEBOUNCE BOTÃO MENU ---
   bool leituraAtualMENU = digitalRead(BTN_MENU);  // Lê direto do pino
   if (leituraAtualMENU != ultimoEstadoCruMENU) {
     tempoUltimaMudancaMENU = millis();            // Reseta timer se houver ruído
@@ -445,15 +460,20 @@ void gerenciarMenuAjuste() {
 
   // Lógica para Resetar Alarme (Segurar MENU por 3 segundos pós-debounce)
   static unsigned long tempoInicioSegurarMenu = 0;
- 
+  
   if (vazamentoDetectado) {
-    if (menuPressionado == LOW) {   // Segurando estabilizado
+    if (menuPressionado == LOW) { 
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 3000) {
-        // RESETAR ALARME E VÁLVULA
         vazamentoDetectado = false;
+        
         digitalWrite(PINO_VALVULA, LOW); // Volta a desligar a válvula
-        distanciaAnterior = lerUltrassonicoEstavel(); 
+
+        // Zera os pulsos residuais antes de rearmar o sistema
+        noInterrupts();
+        contadorPulsosFluxo = 0;
+        interrupts();
+
         lcd.clear();
         lcd.backlight();
         lcd.print("ALARME RESETADO");
@@ -464,13 +484,11 @@ void gerenciarMenuAjuste() {
     } else {
       tempoInicioSegurarMenu = 0;
     }
-    return; // Impede entrar no menu se estiver em alarme
+    return; // Impede de entrar no menu se estiver em alarme
   }
 
   // 2. TELA PRINCIPAL
   if (modoMenu == 0) {
-    
-    // ENTRAR NO MENU (Segurar 3s)
     if (menuPressionado == LOW) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 3000) {
@@ -497,8 +515,8 @@ void gerenciarMenuAjuste() {
       lcd.clear();
     }
   } 
-  
-  // 3. DENTRO DO MENU
+
+    // 3. DENTRO DO MENU
   else {
     // Avançar Telas (1 clique simples)
     if (menuFoiClicado) {
@@ -549,7 +567,6 @@ void gerenciarMenuAjuste() {
 }
 
 // --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
-
 // Função utilitária para desenhar HH:MM a partir de minutos totais
 void printHoraFormatada(int minutosTotais) {
   int h = minutosTotais / 60;
@@ -560,7 +577,6 @@ void printHoraFormatada(int minutosTotais) {
   if(m < 10) lcd.print('0');
   lcd.print(m);
 }
-
 
 void telaAjusteHora() {
   lcd.backlight(); 
@@ -599,7 +615,6 @@ void telaAjusteHora() {
   }
   lcd.print("     "); 
 }
-
 
 void atualizarBarraLEDsCFTV() {
   int dist = lerUltrassonicoEstavel();
@@ -657,10 +672,9 @@ void telaNivelGama() {
   if (percLuz < 10) lcd.print(" ");  
   lcd.print(percLuz);
   lcd.print("% (");
-  lcd.print(pwmAtualGlobal); // Valor bruto 0-255 enviado ao pino
+  lcd.print(pwmAtualGlobal);
   lcd.print(")  "); 
 }
-
 
 void telaAlarme() {
   lcd.setCursor(0, 0);
