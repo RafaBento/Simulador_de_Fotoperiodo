@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.3
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.4
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -23,8 +23,8 @@
 #define ENDERECO_PCF_LEDS 0x26 
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
-const int DISTANCIA_TANQUE_VAZIO = 45; // cm (Ajustar em campo)
-const int DISTANCIA_TANQUE_CHEIO = 15;  // cm (Ajustar em campo)
+const int DISTANCIA_TANQUE_VAZIO = 30; // cm (Ajustar em campo)
+const int DISTANCIA_TANQUE_CHEIO = 14;  // cm (Ajustar em campo)
 const unsigned long tempoDebounce = 50; 
 
 #define EEPROM_INIT_CODE 0x42 
@@ -67,7 +67,7 @@ bool valvulaLigada = false;
 
 // --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
 unsigned long tempoBombaLigada = 0;
-const unsigned long TEMPO_MAXIMO_BOMBA = 10000; // x minutos em milissegundos (ajustar em campo)
+const unsigned long TEMPO_MAXIMO_BOMBA = 420000; // 7 minutos em milissegundos (ajustar em campo)
 bool erroBombaTravada = false; // FLAG DE ERRO
 
 
@@ -119,7 +119,7 @@ void setup() {
     lcd.print("Erro no RTC!");
     while (1); 
   }
-
+//=================================================================================================
   // Inicialização EEPROM e Leitura dos Dados
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
@@ -156,7 +156,7 @@ void setup() {
 
   wdt_enable(WDTO_8S);
 }
-
+//============================================================================================================
 void loop() {
   wdt_reset(); 
   
@@ -195,7 +195,7 @@ void loop() {
 
   processarDebounceBotoes();
   gerenciarMenuAjuste();
-
+//=====================================================================================
   // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
   static unsigned long tempoSegurandoUP = 0;
 
@@ -234,7 +234,7 @@ void loop() {
       telaPrincipal(); 
     }
   }
-
+//======================================================================================
   // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
     ultimoCicloLuz += 1000; // Correção para evitar drift de tempo
@@ -243,7 +243,7 @@ void loop() {
       controlarLuz();
     }
   }
-
+//======================================================================================
   // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
   if (millis() - ultimoCicloUltrassom >= 5000) { 
     ultimoCicloUltrassom = millis(); 
@@ -255,7 +255,7 @@ void loop() {
     }
   }
 }
-
+//======================================================================================
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
 void controlarNivelAgua() {
   // Intertravamento: A bomba SÓ pode ligar se NÃO houver erro travado na memória
@@ -281,7 +281,7 @@ void controlarNivelAgua() {
     }
   }
 }
-
+//======================================================================================
 // --- FOTOPERÍODO E GAMA ---
 void controlarLuz() {
   long minutosAtuais = agora.hour() * 60 + agora.minute();
@@ -339,7 +339,7 @@ void controlarLuz() {
   //analogWrite(PINO_DIMMER, pwmAtualGlobal); // removido do codigo original
   estadoLuz = (pwmAtualGlobal > 0);
 }
-
+//========================================================================================
 // --- HARDWARE E SENSORES ---
 int lerUltrassonicoEstavel() {
   long soma = 0;
@@ -358,7 +358,7 @@ int lerUltrassonicoEstavel() {
   }
   return soma / 3;
 }
-
+//===========================================================================================
 void atualizarBarraLEDsCFTV() {
   int dist = lerUltrassonicoEstavel();
   porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
@@ -379,7 +379,7 @@ void atualizarBarraLEDsCFTV() {
   Wire.write(~estadoLeds); //Anodo comum
   Wire.endTransmission();
 }
-
+//==========================================================================================
 // --- BOTÕES E MENU INTELIGENTE ---
 void processarDebounceBotoes() {
   static unsigned long tempoUltimaMudancaMENU = 0;
@@ -536,7 +536,7 @@ void gerenciarMenuAjuste() {
     }
   }
 }
-
+//=========================================================================================================================================
 // --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
 void printHoraFormatada(int minutosTotais) {
   int h = minutosTotais / 60;
@@ -548,6 +548,7 @@ void printHoraFormatada(int minutosTotais) {
   lcd.print(m);
 }
 
+//=========================================================================================================================================
 void telaAjusteHora() {
   lcd.backlight(); 
   lcd.setCursor(0, 0);
@@ -584,6 +585,8 @@ void telaAjusteHora() {
   }
   lcd.print("     "); 
 }
+
+//=========================================================================================================================================
 
 void telaPrincipal() {
   lcd.setCursor(0, 0);
@@ -626,6 +629,8 @@ void telaPrincipal() {
   }
 }
 
+//=========================================================================================================================================
+
 void telaNivelAgua() {
   lcd.setCursor(0, 0);
   if (valvulaLigada) lcd.print("ENCHENDO A CAIXA"); 
@@ -640,6 +645,8 @@ void telaNivelAgua() {
   lcd.print("%          "); 
 }
 
+//=========================================================================================================================================
+
 void telaErroBomba() {
   lcd.setCursor(0, 0);
   bool pisca = ((millis() / 2000) % 2 == 0);
@@ -653,6 +660,8 @@ void telaErroBomba() {
   lcd.setCursor(0, 1);
   lcd.print("SEGURE UP (5s)  ");
 }
+
+//=========================================================================================================================================
 
 void telaNivelGama() {
   lcd.setCursor(0, 0);
@@ -669,7 +678,9 @@ void telaNivelGama() {
   lcd.print(")  "); 
 }
 
-// --- FUNÇÃO GERENCIADORA DE PWM ---
+//=========================================================================================================================================
+
+// --- FUNÇÃO GERENCIADORA DE PWM (SOFTSTART) ---
 void aplicarPWMSeguro(byte pinoLuz, byte pwmAlvo) {
   static byte pwmRealNaPlaca = 0; // Memória do hardware, começa em 0 no boot
 
