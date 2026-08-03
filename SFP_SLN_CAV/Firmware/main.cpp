@@ -1,102 +1,209 @@
-// SIMULADOR DE FOTOPERIODO - VERSÃO 1.0
-#include <Arduino.h>
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 1.1
+ * Hardware: ATmega328P, DS3232, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
+ * Detecção de vazamento por taxa de variação de nível, sem sensor de fluxo.
+ */
+
 #include <Wire.h>
-#include <RTClib.h> // Precisa instalar a biblioteca "RTClib by Adafruit"
+#include <LiquidCrystal_I2C.h>
+#include <RTClib.h>
 
-RTC_DS3231 rtc;
+// --- MAPEAMENTO DE PINOS ---
+#define PINO_LDR        A0
+#define BTN_MENU        A1
+#define BTN_UP          A2  // Botão UP / Consulta Nível
+#define BTN_DOWN        A3  // Botão DOWN
+#define PINO_DIMMER     3   // PWM para MOSFET da Luz
+#define PINO_VALVULA    9   // Relé da Válvula
+#define PINO_TRIGGER    10  // Ultrassônico Gatilho (IO10/PB2)
+#define PINO_ECHO       11  // Ultrassônico Retorno (IO11/PB3)
 
-// DEFINIÇÕES DE PINOS
-const int pinoLED = 3; // Pino PWM
+// --- CONFIGURAÇÕES DO SISTEMA ---
+const int NIVEL_LUZ_ESCURO = 400; // Ajuste conforme o Trimpot
+const int DISTANCIA_TANQUE_VAZIO = 100; // cm (Fundo do tanque)
+const int DISTANCIA_TANQUE_CHEIO = 10;  // cm (Borda)
+const int LIMITE_QUEDA_VAZAMENTO = 5;   // Se baixar 5cm em pouco tempo = VAZAMENTO
 
-// TABELA DE CORREÇÃO GAMA (256 valores)
-const uint8_t gamma8[] PROGMEM = {
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,
-    1,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  2,
-    2,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  5,  5,  5,
-    5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8,  9,  9,  9, 10,
-   10, 10, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 15, 15, 16, 16,
-   17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 24, 24, 25,
-   25, 26, 27, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36,
-   37, 38, 39, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50,
-   51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 66, 67, 68,
-   69, 70, 72, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89,
-   90, 92, 93, 95, 96, 98, 99,101,102,104,105,107,109,110,112,114,
-  115,117,119,120,122,124,126,127,129,131,133,135,137,138,140,142,
-  144,146,148,150,152,154,156,158,160,162,164,167,169,171,173,175,
-  177,180,182,184,186,189,191,193,196,198,200,203,205,208,210,213,
-  215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
-};
+// --- OBJETOS ---
+LiquidCrystal_I2C lcd(0x27, 16, 2); // Endereço 0x27, 16 Colunas e 2 Linhas
+RTC_DS3231 rtc; // Foi preciso usar RTC_DS3231 porque a biblioteca nao reconeceu o DS3232, o resto do código segue inalterado
+
+// --- VARIÁVEIS GLOBAIS ---
+DateTime agora;
+unsigned long ultimoCiclo = 0;
+unsigned long ultimoTesteVazamento = 0;
+int distanciaAnterior = 0;
+bool vazamentoDetectado = false;
+bool mostrarNivel = false; // Flag para mudar a tela temporariamente
+
+// Ícone de Gota (Opcional, só estética)
+byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00};
 
 void setup() {
-  pinMode(pinoLED, OUTPUT);
-  Serial.begin(9600);
+  // Configura Pinos
+  pinMode(PINO_DIMMER, OUTPUT);
+  pinMode(PINO_VALVULA, OUTPUT);
+  pinMode(PINO_TRIGGER, OUTPUT);
+  pinMode(PINO_ECHO, INPUT);
   
+  // Botões com Pull-Up Interno (Lógica Invertida)
+  pinMode(BTN_MENU, INPUT_PULLUP);
+  pinMode(BTN_UP, INPUT_PULLUP);
+  pinMode(BTN_DOWN, INPUT_PULLUP);
+
+  // Inicializa Periféricos
+  Wire.begin();
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, gota);
+
   if (!rtc.begin()) {
-    Serial.println("Erro: RTC nao encontrado!");
+    lcd.print("Erro no RTC!");
     while (1);
   }
 
-  // Descomentar a linha abaixo APENAS UMA VEZ para acertar a hora do módulo. Depois, comentar novamente e fazer o upload de novo para não resetar a hora toda vez que ligar.
-  // rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  // Estado Inicial
+  digitalWrite(PINO_VALVULA, LOW); // Válvula Fechada por segurança
+  analogWrite(PINO_DIMMER, 0);     // Luz Apagada
+  
+  // Leitura inicial para referência do vazamento
+  distanciaAnterior = lerUltrassonico();
+  
+  lcd.setCursor(0,0);
+  lcd.print("SISTEMA INICIADO");
+  delay(2000);
+  lcd.clear();
 }
 
 void loop() {
-  DateTime agora = rtc.now();
+  agora = rtc.now();
   
-  // Converte a hora atual em "minutos totais desde a meia noite" para facilitar a conta
-  // Ex: 04:00 = 240 minutos.
-  int minutosDoDia = (agora.hour() * 60) + agora.minute();
-  
-  int nivelPWM = 0; // Padrão é apagado
-
-  // --- LÓGICA DOS HORÁRIOS ---
-
-  // 1. NASCER DO SOL (04:00 até 04:30) - Dura 30 min
-  if (minutosDoDia >= 240 && minutosDoDia < 270) {
-    // Mapeia o tempo atual (240 a 270) para uma escala de 0 a 255
-    int progresso = map(minutosDoDia, 240, 269, 0, 255);
-    nivelPWM = pgm_read_byte(&gamma8[progresso]); 
-  }
-  
-  // 2. MANHÃ (04:30 até 08:00) - Luz Total
-  else if (minutosDoDia >= 270 && minutosDoDia < 480) {
-    nivelPWM = 255;
-  }
-  
-  // 3. DIA (08:00 até 16:00) - Luz Desligada (Sol natural)
-  else if (minutosDoDia >= 480 && minutosDoDia < 960) {
-    nivelPWM = 0;
-  }
-  
-  // 4. TARDE (16:00 até 19:30) - Luz Total (Preparo para anoitecer)
-  else if (minutosDoDia >= 960 && minutosDoDia < 1170) {
-    nivelPWM = 255;
-  }
-  
-  // 5. PÔR DO SOL (19:30 até 20:00) - Dura 30 min
-  else if (minutosDoDia >= 1170 && minutosDoDia < 1200) {
-    // Mapeia o tempo atual (1170 a 1200) para escala INVERSA (255 a 0)
-    int progresso = map(minutosDoDia, 1170, 1199, 255, 0);
-    nivelPWM = pgm_read_byte(&gamma8[progresso]);
-  }
-  
-  // 6. NOITE (20:00 até 04:00) - Apagado
-  else {
-    nivelPWM = 0;
+  // --- VERIFICAÇÃO DE BOTÕES ---
+  if (digitalRead(BTN_UP) == LOW) {
+    mostrarNivel = true; // Segurou UP: Mostra Nível
+  } else {
+    mostrarNivel = false; // Soltou UP: Volta pro Relógio
   }
 
-  // Envia o sinal para o MOSFET
-  analogWrite(pinoLED, nivelPWM);
-  
-  // Debug para acompanhar no Monitor Serial (opcional)
-  Serial.print(agora.hour());
-  Serial.print(":");
-  Serial.print(agora.minute());
-  Serial.print(" | MinutosTotais: ");
-  Serial.print(minutosDoDia);
-  Serial.print(" | PWM: ");
-  Serial.println(nivelPWM);
+  // --- ATUALIZAÇÃO DO DISPLAY ---
+  if (mostrarNivel) {
+    telaNivelAgua();
+  } else if (vazamentoDetectado) {
+    telaAlarme();
+  } else {
+    telaPrincipal();
+  }
 
-  delay(1000); // Atualiza a cada 1 segundo
+  // --- LÓGICA DE CONTROLE (Roda a cada 1 segundo) ---
+  if (millis() - ultimoCiclo > 1000) {
+    ultimoCiclo = millis();
+    controlarLuz();
+  }
+
+  // --- VERIFICAÇÃO DE VAZAMENTO (Roda a cada N minutos - Ajustável) ---
+  // Aqui coloquei 10 seg para testar. Ajuste final deve ser feito em campo
+  if (millis() - ultimoTesteVazamento > 10000) { 
+    verificarVazamento();
+    ultimoTesteVazamento = millis();
+  }
+}
+
+// --- FUNÇÕES AUXILIARES ---
+
+void controlarLuz() {
+  int leituraLDR = analogRead(PINO_LDR);
+  
+  // Exemplo: Luzes ligadas entre 17h e 21h SE estiver escuro
+  bool horarioLuz = (agora.hour() >= 17 && agora.hour() < 21);
+  bool estaEscuro = (leituraLDR < NIVEL_LUZ_ESCURO);
+
+  if (horarioLuz && estaEscuro) {
+    // Acende Suave (Opcional) ou Direto
+    analogWrite(PINO_DIMMER, 255); // 100% (Basta usar um valor menor para dimerizar)
+  } else {
+    analogWrite(PINO_DIMMER, 0);   // Apaga
+  }
+}
+
+int lerUltrassonico() {
+  // Gera pulso de 10us
+  digitalWrite(PINO_TRIGGER, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PINO_TRIGGER, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PINO_TRIGGER, LOW);
+  
+  // Lê o tempo de retorno
+  long duracao = pulseIn(PINO_ECHO, HIGH);
+  int distancia = duracao * 0.034 / 2; // Converte para cm
+  return distancia;
+}
+
+void verificarVazamento() {
+  if (vazamentoDetectado) return; // Se já travou, não faz nada
+
+  int distanciaAtual = lerUltrassonico();
+  
+  // Lógica: Se a distância AUMENTOU muito (nível da água desceu) e o tanque não estava enchendo
+  int diferenca = distanciaAtual - distanciaAnterior;
+
+  if (diferenca > LIMITE_QUEDA_VAZAMENTO) {
+    // Nível caiu rápido demais!
+    vazamentoDetectado = true;
+    digitalWrite(PINO_VALVULA, LOW); // Trava Válvula FECHADA
+  } else if (diferenca < 0) {
+    // Nível subiu (está enchendo), atualiza referência
+    distanciaAnterior = distanciaAtual; 
+  } else {
+    // Variação normal, atualiza referência lentamente
+    distanciaAnterior = distanciaAtual;
+  }
+}
+
+// --- TELAS ---
+
+void telaPrincipal() {
+  lcd.setCursor(0, 0);
+  // Formata Hora: 12:05:00
+  if(agora.hour() < 10) lcd.print('0');
+  lcd.print(agora.hour());
+  lcd.print(':');
+  if(agora.minute() < 10) lcd.print('0');
+  lcd.print(agora.minute());
+  
+  lcd.setCursor(10, 0);
+  lcd.print("Luz:");
+  // Mostra se a luz está ON ou OFF
+  if(digitalRead(PINO_DIMMER)) lcd.print("ON ");
+  else lcd.print("OFF");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Status: OK      ");
+}
+
+void telaNivelAgua() {
+  int dist = lerUltrassonico();
+  // Converte cm para %. Supondo: 100cm = 0%, 10cm = 100%
+  int porcentagem = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
+  porcentagem = constrain(porcentagem, 0, 100); // Trava entre 0 e 100
+
+  lcd.setCursor(0, 0);
+  lcd.print("NIVEL DO TANQUE ");
+  lcd.setCursor(0, 1);
+  lcd.write(0); // Ícone de gota
+  lcd.print(" ");
+  lcd.print(porcentagem);
+  lcd.print("%  (");
+  lcd.print(dist);
+  lcd.print("cm)   ");
+}
+
+void telaAlarme() {
+  lcd.setCursor(0, 0);
+  lcd.print("! ALARME VAZTO !");
+  lcd.setCursor(0, 1);
+  lcd.print("VALVULA FECHADA ");
+  
+  // Pisca o Backlight para chamar atenção (Opcional)
+  if ((millis() / 500) % 2 == 0) lcd.noBacklight();
+  else lcd.backlight();
 }
