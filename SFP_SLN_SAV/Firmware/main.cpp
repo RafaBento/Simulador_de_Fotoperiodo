@@ -249,11 +249,7 @@ void loop() {
     ultimoCicloUltrassom = millis(); 
     
     atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
-    
-    if (modoMenu == 0) {
-      controlarNivelAgua();   // Avalia a histerese da válvula
-    }
-  }
+    controlarNivelAgua();   // Avalia a histerese da válvula
 }
 //======================================================================================
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
@@ -278,6 +274,7 @@ void controlarNivelAgua() {
     if (!erroBombaTravada) {
       erroBombaTravada = true; 
       EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 1); 
+      modoMenu = 0; // Força a saída do Menu se estourar o tempo de enchimento da caixa
     }
   }
 }
