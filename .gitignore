@@ -1,0 +1,12 @@
+# Ignorar arquivos de compilacao do Arduino
+*.hex
+*.elf
+*.bin
+build/
+
+# Ignorar lixo binario e arquivos de backup do Proteus
+*.DBK
+*.dbk
+*.workspace
+*.~ds
+*.~ly
