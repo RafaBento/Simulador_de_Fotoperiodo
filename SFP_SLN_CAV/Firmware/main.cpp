@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 1.1
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 1.2
  * Hardware: ATmega328P, DS3232, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de vazamento por taxa de variação de nível, sem sensor de fluxo.
  */
@@ -12,10 +12,17 @@
 #define BTN_MENU        A1
 #define BTN_UP          A2  // Botão UP / Consulta Nível
 #define BTN_DOWN        A3  // Botão DOWN
-#define PINO_DIMMER     3   // PWM para MOSFET da Luz
+#define PINO_DIMMER     3   // Pino PWM
 #define PINO_VALVULA    9   // Relé da Válvula
 #define PINO_TRIGGER    10  // Ultrassônico Gatilho (IO10/PB2)
 #define PINO_ECHO       11  // Ultrassônico Retorno (IO11/PB3)
+
+// --- PINOS DOS LEDs CFTV (Nível da Água) ---
+#define LED_20          4
+#define LED_40          5
+#define LED_60          6
+#define LED_80          7
+#define LED_100         8
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
 const int NIVEL_LUZ_ESCURO = 400; // Ajuste conforme o Trimpot
@@ -24,28 +31,37 @@ const int DISTANCIA_TANQUE_CHEIO = 10;  // cm (Borda)
 const int LIMITE_QUEDA_VAZAMENTO = 5;   // Se baixar 5cm em pouco tempo = VAZAMENTO
 
 // --- OBJETOS ---
-LiquidCrystal_I2C lcd(0x27, 16, 2); // Endereço 0x27, 16 Colunas e 2 Linhas
-RTC_DS3231 rtc; // Foi preciso usar RTC_DS3231 porque a biblioteca nao reconeceu o DS3232, o resto do código segue inalterado
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+RTC_DS3231 rtc; 
 
 // --- VARIÁVEIS GLOBAIS ---
 DateTime agora;
 unsigned long ultimoCiclo = 0;
 unsigned long ultimoTesteVazamento = 0;
 int distanciaAnterior = 0;
+int porcentagemAguaGlobal = 0; // Guarda o nível atual para os LEDs
 bool vazamentoDetectado = false;
-bool mostrarNivel = false; // Flag para mudar a tela temporariamente
+bool mostrarNivel = false; 
+bool estadoLuz = false; // Flag para saber se a luz está ligada
 
-// Ícone de Gota (Opcional, só estética)
+// Ícone de Gota (apenas estética)
 byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00};
 
 void setup() {
-  // Configura Pinos
+  // Configura Pinos Sensores/Atuadores
   pinMode(PINO_DIMMER, OUTPUT);
   pinMode(PINO_VALVULA, OUTPUT);
   pinMode(PINO_TRIGGER, OUTPUT);
   pinMode(PINO_ECHO, INPUT);
   
-  // Botões com Pull-Up Interno (Lógica Invertida)
+  // Configura Pinos dos LEDs (CFTV)
+  pinMode(LED_20, OUTPUT);
+  pinMode(LED_40, OUTPUT);
+  pinMode(LED_60, OUTPUT);
+  pinMode(LED_80, OUTPUT);
+  pinMode(LED_100, OUTPUT);
+  
+  // Botões com Pull-Up Interno
   pinMode(BTN_MENU, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
@@ -62,15 +78,15 @@ void setup() {
   }
 
   // Estado Inicial
-  digitalWrite(PINO_VALVULA, LOW); // Válvula Fechada por segurança
-  analogWrite(PINO_DIMMER, 0);     // Luz Apagada
+  digitalWrite(PINO_VALVULA, LOW); 
+  analogWrite(PINO_DIMMER, 0);     
   
-  // Leitura inicial para referência do vazamento
-  distanciaAnterior = lerUltrassonico();
+  // Leitura inicial estabilizada
+  distanciaAnterior = lerUltrassonicoEstavel();
   
   lcd.setCursor(0,0);
   lcd.print("SISTEMA INICIADO");
-  delay(2000);
+  delay(1000);
   lcd.clear();
 }
 
@@ -79,9 +95,9 @@ void loop() {
   
   // --- VERIFICAÇÃO DE BOTÕES ---
   if (digitalRead(BTN_UP) == LOW) {
-    mostrarNivel = true; // Segurou UP: Mostra Nível
+    mostrarNivel = true; 
   } else {
-    mostrarNivel = false; // Soltou UP: Volta pro Relógio
+    mostrarNivel = false; 
   }
 
   // --- ATUALIZAÇÃO DO DISPLAY ---
@@ -97,10 +113,10 @@ void loop() {
   if (millis() - ultimoCiclo > 1000) {
     ultimoCiclo = millis();
     controlarLuz();
+    atualizarBarraLEDsCFTV(); // Atualiza os LEDs
   }
 
-  // --- VERIFICAÇÃO DE VAZAMENTO (Roda a cada N minutos - Ajustável) ---
-  // Aqui coloquei 10 seg para testar. Ajuste final deve ser feito em campo
+  // --- VERIFICAÇÃO DE VAZAMENTO ---
   if (millis() - ultimoTesteVazamento > 10000) { 
     verificarVazamento();
     ultimoTesteVazamento = millis();
@@ -117,44 +133,58 @@ void controlarLuz() {
   bool estaEscuro = (leituraLDR < NIVEL_LUZ_ESCURO);
 
   if (horarioLuz && estaEscuro) {
-    // Acende Suave (Opcional) ou Direto
-    analogWrite(PINO_DIMMER, 255); // 100% (Basta usar um valor menor para dimerizar)
+    analogWrite(PINO_DIMMER, 255); 
+    estadoLuz = true;
   } else {
-    analogWrite(PINO_DIMMER, 0);   // Apaga
+    analogWrite(PINO_DIMMER, 0);   
+    estadoLuz = false;
   }
 }
 
-int lerUltrassonico() {
-  // Gera pulso de 10us
-  digitalWrite(PINO_TRIGGER, LOW);
-  delayMicroseconds(2);
-  digitalWrite(PINO_TRIGGER, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PINO_TRIGGER, LOW);
-  
-  // Lê o tempo de retorno
-  long duracao = pulseIn(PINO_ECHO, HIGH);
-  int distancia = duracao * 0.034 / 2; // Converte para cm
-  return distancia;
+// NOVA FUNÇÃO: Leitura estável com filtro de marola e timeout de segurança
+int lerUltrassonicoEstavel() {
+  long soma = 0;
+  for(int i=0; i<3; i++) {
+    digitalWrite(PINO_TRIGGER, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PINO_TRIGGER, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PINO_TRIGGER, LOW);
+    
+    // TIMEOUT de 25000us (aprox 4 metros). Evita travar o microcontrolador!
+    long duracao = pulseIn(PINO_ECHO, HIGH, 25000); 
+    if(duracao == 0) duracao = 25000; // Se falhar, assume distância máxima
+    
+    soma += (duracao * 0.034 / 2);
+    delay(10); // Pausa breve entre os pulsos
+  }
+  return soma / 3; // Retorna a média
+}
+
+void atualizarBarraLEDsCFTV() {
+  int dist = lerUltrassonicoEstavel();
+  // Calcula e salva na variável global para o LCD usar também
+  porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
+  porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
+
+  // Acende os LEDs em cascata conforme a porcentagem
+  digitalWrite(LED_20, porcentagemAguaGlobal >= 20 ? HIGH : LOW);
+  digitalWrite(LED_40, porcentagemAguaGlobal >= 40 ? HIGH : LOW);
+  digitalWrite(LED_60, porcentagemAguaGlobal >= 60 ? HIGH : LOW);
+  digitalWrite(LED_80, porcentagemAguaGlobal >= 80 ? HIGH : LOW);
+  digitalWrite(LED_100, porcentagemAguaGlobal >= 95 ? HIGH : LOW); // 95 para garantir que acende perto do topo
 }
 
 void verificarVazamento() {
-  if (vazamentoDetectado) return; // Se já travou, não faz nada
+  if (vazamentoDetectado) return; 
 
-  int distanciaAtual = lerUltrassonico();
-  
-  // Lógica: Se a distância AUMENTOU muito (nível da água desceu) e o tanque não estava enchendo
+  int distanciaAtual = lerUltrassonicoEstavel();
   int diferenca = distanciaAtual - distanciaAnterior;
 
   if (diferenca > LIMITE_QUEDA_VAZAMENTO) {
-    // Nível caiu rápido demais!
     vazamentoDetectado = true;
-    digitalWrite(PINO_VALVULA, LOW); // Trava Válvula FECHADA
-  } else if (diferenca < 0) {
-    // Nível subiu (está enchendo), atualiza referência
-    distanciaAnterior = distanciaAtual; 
+    digitalWrite(PINO_VALVULA, LOW); 
   } else {
-    // Variação normal, atualiza referência lentamente
     distanciaAnterior = distanciaAtual;
   }
 }
@@ -163,7 +193,6 @@ void verificarVazamento() {
 
 void telaPrincipal() {
   lcd.setCursor(0, 0);
-  // Formata Hora: 12:05:00
   if(agora.hour() < 10) lcd.print('0');
   lcd.print(agora.hour());
   lcd.print(':');
@@ -172,8 +201,7 @@ void telaPrincipal() {
   
   lcd.setCursor(10, 0);
   lcd.print("Luz:");
-  // Mostra se a luz está ON ou OFF
-  if(digitalRead(PINO_DIMMER)) lcd.print("ON ");
+  if(estadoLuz) lcd.print("ON ");
   else lcd.print("OFF");
 
   lcd.setCursor(0, 1);
@@ -181,20 +209,14 @@ void telaPrincipal() {
 }
 
 void telaNivelAgua() {
-  int dist = lerUltrassonico();
-  // Converte cm para %. Supondo: 100cm = 0%, 10cm = 100%
-  int porcentagem = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
-  porcentagem = constrain(porcentagem, 0, 100); // Trava entre 0 e 100
-
+  // Usa a variável global que já foi calculada pela função dos LEDs
   lcd.setCursor(0, 0);
   lcd.print("NIVEL DO TANQUE ");
   lcd.setCursor(0, 1);
-  lcd.write(0); // Ícone de gota
+  lcd.write(0); 
   lcd.print(" ");
-  lcd.print(porcentagem);
-  lcd.print("%  (");
-  lcd.print(dist);
-  lcd.print("cm)   ");
+  lcd.print(porcentagemAguaGlobal);
+  lcd.print("%          "); 
 }
 
 void telaAlarme() {
@@ -203,7 +225,6 @@ void telaAlarme() {
   lcd.setCursor(0, 1);
   lcd.print("VALVULA FECHADA ");
   
-  // Pisca o Backlight para chamar atenção (Opcional)
   if ((millis() / 500) % 2 == 0) lcd.noBacklight();
   else lcd.backlight();
 }
