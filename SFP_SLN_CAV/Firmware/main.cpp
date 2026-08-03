@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 6.0
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 6.1
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, YF-S201, Relé, IRF3205.
  * Detecção de vazamento através de sensor de fluxo.
  */
@@ -10,15 +10,15 @@
 #include <EEPROM.h>  // Memória Não Volátil
 
 // --- MAPEAMENTO DE PINOS ---
-#define PINO_SENSOR_FLUXO   2   // Fio amarelo do YF-S201 (Obrigatório ser pino 2 ou 3 para interrupção)
-#define PINO_LDR           A0    // Pino para o LDR
-#define BTN_MENU           A1    // Botão menu
-#define BTN_UP             A2    // Botão UP 
-#define BTN_DOWN           A3    // Botão DOWN
-#define PINO_DIMMER         3     // Pino do PWM
-#define PINO_VALVULA        9     // Pino de ligar a válvula solenóide tippo NA
-#define PINO_TRIGGER       10    // Pino do Sensor de Nível
-#define PINO_ECHO          11    // Pinno do sensor de nível
+#define PINO_SENSOR_FLUXO 2   // Fio amarelo do YF-S201 (Obrigatório ser pino 2 ou 3 para interrupção)
+#define PINO_LDR        A0    // Pino para o LDR
+#define BTN_MENU        A1    // Botão menu
+#define BTN_UP          A2    // Botão UP 
+#define BTN_DOWN        A3    // Botão DOWN
+#define PINO_DIMMER     3     // Pino do PWM
+#define PINO_VALVULA    9     // Pino de ligar a válvula solenóide tippo NA
+#define PINO_TRIGGER    10    // Pino do Sensor de Nível
+#define PINO_ECHO       11    // Pino do sensor de nível
 
 // Endereço I2C do Módulo PCF8574 extra para LEDs
 #define ENDERECO_PCF_LEDS 0x26 
@@ -30,10 +30,10 @@ const int DISTANCIA_TANQUE_CHEIO = 10;  // cm (Ajustar em campo)
 // Limite de pulsos do Sensor de Fluxo a cada 10 segundos para considerar vazamento
 // O YF-S201 gera aprox. 450 pulsos por litro. O valor abaixo deve ser ajustado na prática
 const int LIMITE_PULSOS_VAZAMENTO = 50; 
-
 const unsigned long tempoDebounce = 50; 
 
 #define EEPROM_INIT_CODE 0x42 
+#define EEPROM_ADDR_LDR  13   // Endereço para salvar o status do LDR
 
 // --- TABELA GAMA (Memória Flash) ---
 const uint8_t gamma8[] PROGMEM = {
@@ -120,7 +120,7 @@ void setup() {
   // Configura o sensor de fluxo e atrela a interrupção
   pinMode(PINO_SENSOR_FLUXO, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PINO_SENSOR_FLUXO), contarPulsos, FALLING);
-  
+
   // Botões com Pull-Up Interno
   pinMode(BTN_MENU, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
@@ -146,7 +146,7 @@ void setup() {
     lcd.clear();
   }
 
-  // Inicialização EEPROM
+  // Inicialização EEPROM e Leitura dos Dados
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
 
@@ -157,6 +157,9 @@ void setup() {
     EEPROM.put(7, t4_tarde100);
     EEPROM.put(9, t5_anoitecerIni);
     EEPROM.put(11, t6_anoitecerFim);
+ 
+    // Configuração inicial do LDR salva como ATIVO (1)
+    EEPROM.write(EEPROM_ADDR_LDR, 1); 
 
     EEPROM.write(0, EEPROM_INIT_CODE); // Salva a formatação
   } else {
@@ -167,6 +170,9 @@ void setup() {
     EEPROM.get(7, t4_tarde100);
     EEPROM.get(9, t5_anoitecerIni);
     EEPROM.get(11, t6_anoitecerFim);
+    
+    // Recupera o status do LDR salvo antes de reiniciar
+    sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1; 
   }
 
   // --- LÓGICA VÁLVULA ---
@@ -201,6 +207,9 @@ void loop() {
     else if (millis() - tempoBotoesPressione >= 1000) {
       sensorLuzAtivo = !sensorLuzAtivo; // Inverte o status do LDR
       
+      // Salva a nova preferência na EEPROM imediatamente
+      EEPROM.write(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
+      
       lcd.clear();
       lcd.backlight();
       if (sensorLuzAtivo) {
@@ -222,8 +231,6 @@ void loop() {
   } else {
     comboPressionado = false; 
   }
-
-  // ------------------------------------------------------------------------
 
    // 1. Processa Debounce de todos os botões
   processarDebounceBotoes();
@@ -257,14 +264,12 @@ void loop() {
     
     if (modoMenu == 0) {
       controlarLuz();
-      if (!vazamentoDetectado) {
-        digitalWrite(PINO_VALVULA, LOW); 
-      }
     }
+    
     atualizarBarraLEDsCFTV(); // Lê o ultrassônico e calcula porcentagemAguaGlobal
   }
 
-  // A verificação de vazamento roda a cada 10 segundos
+  // --- VERIFICAÇÃO DE VAZAMENTO (A cada 10s) ---
   if (modoMenu == 0 && (millis() - ultimoTesteVazamento > 10000)) { 
     verificarVazamento();
     ultimoTesteVazamento = millis();
@@ -295,78 +300,65 @@ void controlarLuz() {
 
   int indiceLinearPWM = 0; // De 0 a 255
 
+  // 1. 04:00 às 04:30 (Amanhecer)
   if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
     long segundosPassados = segundosDoDia - (t1_amanhecerIni * 60L);
     long segundosTotaisRampa = (t2_amanhecerFim - t1_amanhecerIni) * 60L; 
     indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 0, 255);
   }
+  // 2. 04:30 às 08:00 (Fixo 100%)
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     indiceLinearPWM = 255;
   }
-  
-  // 3. HORÁRIO COMERCIAL (Controle LDR ou 100% Manual)
+  // 3. 08:00 às 16:00 (LDR Ativo OU Fixo 0%)
   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
-    
     if (sensorLuzAtivo) {
-      // --- LÓGICA INTEGRATIVA LENTA (Média de 5 Segundos) ---
-      static int pwmIntegrativo = 0; 
-      static unsigned long somaLDR = 0;
-      static int contadorLeituras = 0;
+      static float pwmIntegrativo = 255; 
       static unsigned long tempoUltimaAcao = millis();
 
-      // Ajustes finos do ambiente
-      const int ALVO_LDR = 400;   // A luz perfeita no chão
-      const int JANELA = 100;     // Tolerância "Deadband"
+      const int ALVO_LDR = 400;   // Ajuste do alvo no trimpot
+      const int JANELA = 80;      
 
-      somaLDR += analogRead(PINO_LDR);
-      contadorLeituras++;
-
-      if (millis() - tempoUltimaAcao >= 5000) {
-        if (contadorLeituras > 0) { 
-          int mediaLDR = somaLDR / contadorLeituras; 
-
-          // Se o LDR ler valores menores no escuro (Padrão Pull-Down), basta manter assim.
-          // Se o  LDR for Pull-Up (valores maiores no escuro), deve-se inverter os sinais de < e >.
-
-          if (mediaLDR < (ALVO_LDR - JANELA)) {
-            pwmIntegrativo++; // Escureceu, sobe 1 degrau
-          } 
-          else if (mediaLDR > (ALVO_LDR + JANELA)) {
-            pwmIntegrativo--; // Clareou muito, desce 1 degrau
-          }
-
-          pwmIntegrativo = constrain(pwmIntegrativo, 0, 255);
-        }
+      if (millis() - tempoUltimaAcao >= 100) { 
+        int leituraLDR = analogRead(PINO_LDR);
         
-        somaLDR = 0;
-        contadorLeituras = 0;
+        // Escuro = leituraLDR BAIXA / Claro = leituraLDR ALTA
+        if (leituraLDR < (ALVO_LDR - JANELA)) {
+          pwmIntegrativo += 0.5; // Escureceu, aumenta a luz
+        } 
+        else if (leituraLDR > (ALVO_LDR + JANELA)) {
+          pwmIntegrativo -= 0.5; // Clareou, diminui a luz
+        }
+
+        if (pwmIntegrativo > 255) pwmIntegrativo = 255;
+        if (pwmIntegrativo < 0) pwmIntegrativo = 0;
+        
         tempoUltimaAcao = millis();
       }
-      indiceLinearPWM = pwmIntegrativo;
+      indiceLinearPWM = (int)pwmIntegrativo;
     } 
     else {
-      // LDR Desligado pelo usuário: forçar luz mínima no horário comercial
+      // REGRA: Se o LDR foi desativado pelo usuario, a luz fica em 0 (Desligada)
       indiceLinearPWM = 0; 
     }
   }
-  
+  // 4. 16:00 às 20:00 (Fixo 100% independente do LDR)
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
     indiceLinearPWM = 255;
   }
+  // 5. 20:00 às 20:30 (Anoitecer)
   else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
     long segundosPassados = segundosDoDia - (t5_anoitecerIni * 60L);
     long segundosTotaisRampa = (t6_anoitecerFim - t5_anoitecerIni) * 60L;
     indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 255, 0); 
   }
+  // 6. 20:30 às 04:00 (Madrugada - Tudo desligado)
   else {
     indiceLinearPWM = 0;
   }
 
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-  
-  // Salva o valor atual na variável Global para o Visor ler
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
-
   analogWrite(PINO_DIMMER, pwmAtualGlobal);
   estadoLuz = (pwmAtualGlobal > 0);
 }
@@ -448,11 +440,12 @@ void processarDebounceBotoes() {
   ultimoEstadoCruDOWN = leituraAtualDOWN;
 }
 
+
 void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
-  if (aumenta) variavelTempo += 15;
-  else variavelTempo -= 15;
+  if (aumenta) variavelTempo += 5;
+  else variavelTempo -= 5;
   if (variavelTempo > 1439) variavelTempo = 0;
-  if (variavelTempo < 0) variavelTempo = 1425;
+  if (variavelTempo < 0) variavelTempo = 1435;
 }
 
 // --- FUNÇÕES DE INTERFACE (MENU USANDO CLICKS ESTÁVEIS) ---
@@ -460,20 +453,22 @@ void gerenciarMenuAjuste() {
 
   // Lógica para Resetar Alarme (Segurar MENU por 3 segundos pós-debounce)
   static unsigned long tempoInicioSegurarMenu = 0;
-  
+  static bool salvamentoExecutado = false;
+  static bool ignorarSoltura = false; // Flag de escudo
+
   if (vazamentoDetectado) {
     if (menuPressionado == LOW) { 
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 3000) {
         vazamentoDetectado = false;
-        
-        digitalWrite(PINO_VALVULA, LOW); // Volta a desligar a válvula
 
-        // Zera os pulsos residuais antes de rearmar o sistema
+        digitalWrite(PINO_VALVULA, LOW); // Volta a desligar a válvula
+        
+        // Zera os pulsos antes de rearmar
         noInterrupts();
         contadorPulsosFluxo = 0;
         interrupts();
-
+        
         lcd.clear();
         lcd.backlight();
         lcd.print("ALARME RESETADO");
@@ -491,13 +486,13 @@ void gerenciarMenuAjuste() {
   if (modoMenu == 0) {
     if (menuPressionado == LOW) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
-      if ((millis() - tempoInicioSegurarMenu) > 3000) {
+      if ((millis() - tempoInicioSegurarMenu) > 1000) {
         lcd.clear();
         modoMenu = 1;
         horaAjuste = agora.hour();
         minutoAjuste = agora.minute();
         tempoInicioSegurarMenu = 0;
-        menuFoiClicado = false; // "Consome" o clique para não pular tela
+        ignorarSoltura = true; // Avisa o sistema para ignorar quando soltar o dedo
       }
     } else {
       tempoInicioSegurarMenu = 0;
@@ -515,15 +510,16 @@ void gerenciarMenuAjuste() {
       lcd.clear();
     }
   } 
-
     // 3. DENTRO DO MENU
   else {
     // Avançar Telas (1 clique simples)
-    if (menuFoiClicado) {
-      lcd.clear(); 
-      modoMenu++;
-      if (modoMenu > 8) {
-        // SALVAR E SAIR
+    if (menuPressionado == LOW) {
+      if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
+      
+      // Salvamento rápido agora zera o cronômetro antes de sair
+      if ((millis() - tempoInicioSegurarMenu) > 1000 && !salvamentoExecutado && !ignorarSoltura) {
+        salvamentoExecutado = true; 
+        
         rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
         EEPROM.put(1, t1_amanhecerIni);
         EEPROM.put(3, t2_amanhecerFim);
@@ -531,39 +527,65 @@ void gerenciarMenuAjuste() {
         EEPROM.put(7, t4_tarde100);
         EEPROM.put(9, t5_anoitecerIni);
         EEPROM.put(11, t6_anoitecerFim);
-        modoMenu = 0;
-        lcd.print("TUDO SALVO!");
-        delay(1000);
+        
         lcd.clear();
+        lcd.print("ALTERACAO  SALVA");
+        lcd.setCursor(0, 1);
+        lcd.print("  COM SUCESSO!  :)");
+        delay(3000);
+        
+        modoMenu = 0;
+        tempoInicioSegurarMenu = 0; 
+        menuFoiClicado = false;     
+        lcd.clear();
+        return;                     
       }
+    } 
+    else { 
+      // --- BOTÃO FOI SOLTO ---
+      if (ignorarSoltura) {
+        ignorarSoltura = false; 
+      } 
+      else if (tempoInicioSegurarMenu > 0) {
+        unsigned long duracao = millis() - tempoInicioSegurarMenu;
+        if (duracao < 1000 && !salvamentoExecutado) {
+          lcd.clear(); 
+          modoMenu++;
+          if (modoMenu > 8) {
+            rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
+            EEPROM.put(1, t1_amanhecerIni);
+            EEPROM.put(3, t2_amanhecerFim);
+            EEPROM.put(5, t3_diaProporcional);
+            EEPROM.put(7, t4_tarde100);
+            EEPROM.put(9, t5_anoitecerIni);
+            EEPROM.put(11, t6_anoitecerFim);
+            modoMenu = 0;
+            lcd.print("SUAS ALTERACOES ");
+            lcd.setCursor(0, 1);
+            lcd.print("FORAM SALVAS! :)");
+            delay(3000);
+            lcd.clear();
+          }
+        }
+      }
+      tempoInicioSegurarMenu = 0;
+      salvamentoExecutado = false;
     }
-  // --- NAVEGAÇÃO DOS 8 ESTADOS DO MENU ---
-  if (modoMenu == 1) { 
-    if (upFoiClicado) { horaAjuste++; if(horaAjuste > 23) horaAjuste = 0; }
-    if (downFoiClicado) { horaAjuste--; if(horaAjuste < 0) horaAjuste = 23; }
-  } else if (modoMenu == 2) { 
-    if (upFoiClicado) { minutoAjuste++; if(minutoAjuste > 59) minutoAjuste = 0; }
-    if (downFoiClicado) { minutoAjuste--; if(minutoAjuste < 0) minutoAjuste = 59; }
-  } else if (modoMenu == 3) { // T1
-    if (upFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, true);
-    if (downFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, false);
-  } else if (modoMenu == 4) { // T2
-    if (upFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, true);
-    if (downFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, false);
-  } else if (modoMenu == 5) { // T3
-    if (upFoiClicado) ajustarVariavelTempo(t3_diaProporcional, true);
-    if (downFoiClicado) ajustarVariavelTempo(t3_diaProporcional, false);
-  } else if (modoMenu == 6) { // T4
-    if (upFoiClicado) ajustarVariavelTempo(t4_tarde100, true);
-    if (downFoiClicado) ajustarVariavelTempo(t4_tarde100, false);
-  } else if (modoMenu == 7) { // T5
-    if (upFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, true);
-    if (downFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, false);
-  } else if (modoMenu == 8) { // T6
-    if (upFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, true);
-    if (downFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, false);
+
+    if (modoMenu == 1) { 
+      if (upFoiClicado) { horaAjuste++; if(horaAjuste > 23) horaAjuste = 0; }
+      if (downFoiClicado) { horaAjuste--; if(horaAjuste < 0) horaAjuste = 23; }
+    } else if (modoMenu == 2) { 
+      if (upFoiClicado) { minutoAjuste++; if(minutoAjuste > 59) minutoAjuste = 0; }
+      if (downFoiClicado) { minutoAjuste--; if(minutoAjuste < 0) minutoAjuste = 59; }
+    } else if (modoMenu == 3) { if (upFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, true); if (downFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, false);
+    } else if (modoMenu == 4) { if (upFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, true); if (downFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, false);
+    } else if (modoMenu == 5) { if (upFoiClicado) ajustarVariavelTempo(t3_diaProporcional, true); if (downFoiClicado) ajustarVariavelTempo(t3_diaProporcional, false);
+    } else if (modoMenu == 6) { if (upFoiClicado) ajustarVariavelTempo(t4_tarde100, true); if (downFoiClicado) ajustarVariavelTempo(t4_tarde100, false);
+    } else if (modoMenu == 7) { if (upFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, true); if (downFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, false);
+    } else if (modoMenu == 8) { if (upFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, true); if (downFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, false);
+    }
   }
-}
 }
 
 // --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
@@ -622,7 +644,7 @@ void atualizarBarraLEDsCFTV() {
   porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
 
   Wire.beginTransmission(ENDERECO_PCF_LEDS);
-  Wire.write(0xFF);  // Temporário: apaga tudo se o módulo não existir
+  Wire.write(0xFF); 
   Wire.endTransmission();
 }
 
@@ -643,14 +665,35 @@ void telaPrincipal() {
   if(estadoLuz) lcd.print("ON ");
   else lcd.print("OFF");
 
+// Painel dinâmico da segunda linha
   lcd.setCursor(0, 1);
-  if (sensorLuzAtivo) lcd.print("Status: OK      ");
-  else lcd.print("Status: LDR OFF "); // Pequeno lembrete na tela inicial!
+  long minutosAtuais = agora.hour() * 60 + agora.minute();
+
+  if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
+    lcd.print("    Amanhecer   ");
+  } 
+  else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
+    lcd.print(" Inicio da Manha"); 
+  } 
+  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+    if (sensorLuzAtivo) lcd.print(" Dia: Sensor ON ");
+    else lcd.print(" Dia: Sensor OF ");
+  } 
+  else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
+    lcd.print("  Fim de Tarde  ");
+  } 
+  else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
+    lcd.print("    Anoitecer   ");
+  } 
+  else {
+    lcd.print("     Noite      ");
+  }
 }
 
 void telaNivelAgua() {
   lcd.setCursor(0, 0);
-  lcd.print("NIVEL DO TANQUE "); 
+  lcd.print("NIVEL DA CAIXA: "); 
+  
   lcd.setCursor(0, 1);
   lcd.write(0); 
   lcd.print(" ");
@@ -662,11 +705,10 @@ void telaNivelAgua() {
 
 void telaNivelGama() {
   lcd.setCursor(0, 0);
-  lcd.print("NIVEL DE LUZ    "); 
+  lcd.print(" NIVEL DE LUZ:  "); 
   lcd.setCursor(0, 1);
-  lcd.print("PWM: ");
+  lcd.print(" PWM:");
   
-  // Calcula uma % rápida só para visualização na tela
   int percLuz = map(pwmAtualGlobal, 0, 255, 0, 100);
   if (percLuz < 100) lcd.print(" "); 
   if (percLuz < 10) lcd.print(" ");  
@@ -678,10 +720,9 @@ void telaNivelGama() {
 
 void telaAlarme() {
   lcd.setCursor(0, 0);
-  lcd.print("!  VAZAMENTO  ! "); // 16 caracteres
+  lcd.print("!  VAZAMENTO  ! "); 
   lcd.setCursor(0, 1);
-  lcd.print("VALVULA FECHADA "); // 16 caracteres
-  // Pisca Backlight usando millis
+  lcd.print("VALVULA FECHADA "); 
   if ((millis() / 500) % 2 == 0) lcd.noBacklight();
   else lcd.backlight();
 }
