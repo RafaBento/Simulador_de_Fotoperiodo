@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.1
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.2
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -29,6 +29,7 @@ const unsigned long tempoDebounce = 50;
 
 #define EEPROM_INIT_CODE 0x42 
 #define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
+#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continue travado evitando que a bomba ligue
 
 // --- TABELA GAMA (Memória Flash) ---
 const uint8_t gamma8[] PROGMEM = {
@@ -130,6 +131,7 @@ void setup() {
     EEPROM.put(11, t6_anoitecerFim);
     
     EEPROM.write(EEPROM_ADDR_LDR, 1); 
+    EEPROM.write(EEPROM_ADDR_ERRO_BOMBA, 0); // 0 = Sem erro de bomba
     EEPROM.write(0, EEPROM_INIT_CODE); 
   } else {
     EEPROM.get(1, t1_amanhecerIni);
@@ -139,7 +141,8 @@ void setup() {
     EEPROM.get(9, t5_anoitecerIni);
     EEPROM.get(11, t6_anoitecerFim);
     
-    sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1; 
+    sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1;
+    erroBombaTravada = EEPROM.read(EEPROM_ADDR_ERRO_BOMBA) == 1; 
   }
 
   digitalWrite(PINO_VALVULA, LOW); 
@@ -203,7 +206,8 @@ void loop() {
     if (digitalRead(BTN_UP) == LOW) {
       if (tempoSegurandoUP == 0) tempoSegurandoUP = millis();
       if (millis() - tempoSegurandoUP >= 5000) {
-        erroBombaTravada = false; // Destrava o sistema
+        erroBombaTravada = false; // Destrava o sistema na RAM
+        EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 0); // Destrava o sistema na EEPROM
         tempoSegurandoUP = 0;
         lcd.clear();
         lcd.print(" BOMBA REARMADA ");
@@ -254,7 +258,8 @@ void loop() {
 
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
 void controlarNivelAgua() {
-  if (porcentagemAguaGlobal <= 10 && !valvulaLigada) {
+  // Intertravamento: A bomba SÓ pode ligar se NÃO houver erro travado na memória
+  if (porcentagemAguaGlobal <= 10 && !valvulaLigada && !erroBombaTravada) {
     valvulaLigada = true; 
     tempoBombaLigada = millis(); // Marca a hora exata da partida
     digitalWrite(PINO_VALVULA, HIGH);
@@ -263,11 +268,17 @@ void controlarNivelAgua() {
     valvulaLigada = false;
     digitalWrite(PINO_VALVULA, LOW);  
   }
-  // FAIL-SAFE: Desliga na marra se estourar o tempo limite (ex: cano quebrado ou sensor sujo)
+  
+  // FAIL-SAFE: Desliga na marra se estourar o tempo limite
   if (valvulaLigada && (millis() - tempoBombaLigada > TEMPO_MAXIMO_BOMBA)) {
     valvulaLigada = false;
     digitalWrite(PINO_VALVULA, LOW);
-    erroBombaTravada = true; // Aciona o estado de falha global
+    
+    // Trava o sistema e salva na memória não-volátil (apenas se mudou de estado)
+    if (!erroBombaTravada) {
+      erroBombaTravada = true; 
+      EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 1); 
+    }
   }
 }
 
@@ -323,7 +334,6 @@ void controlarLuz() {
   }
 
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
   aplicarPWMSeguro(PINO_DIMMER, pwmAtualGlobal); //soft-start adicionado
   //analogWrite(PINO_DIMMER, pwmAtualGlobal); // removido do codigo original
