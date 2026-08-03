@@ -27,6 +27,12 @@ const int DISTANCIA_TANQUE_VAZIO = 30; // cm (Ajustar em campo)
 const int DISTANCIA_TANQUE_CHEIO = 14;  // cm (Ajustar em campo)
 const unsigned long tempoDebounce = 50; 
 
+// --- VARIÁVEIS DE SEGURANÇA TÉRMICA ---
+unsigned long ultimoCicloTemp = 0;
+bool erroSuperaquecimento = false;
+const float TEMP_CRITICA = 55.0;     // Temperatura de corte
+const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
+
 #define EEPROM_INIT_CODE 0x42 
 #define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
 #define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continue travado evitando que a bomba ligue
@@ -199,8 +205,16 @@ void loop() {
   // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
   static unsigned long tempoSegurandoUP = 0;
 
-  if (erroBombaTravada) {
-    telaErroBomba(); // Esconde a tela principal
+  if (erroSuperaquecimento) {
+    // Alarme Visual de Calor (Prioridade 1)
+    lcd.setCursor(0, 0);
+    lcd.print("Superaquecimento");
+    lcd.setCursor(0, 1);
+    lcd.print("Luz Desligada!!!");
+    modoMenu = 0; // Força a saída de qualquer menu ativo
+  }
+  else if (erroBombaTravada) {
+    telaErroBomba(); // Esconde a tela principal (Prioridade 2)
     
     // Lógica para rearmar segurando o botão UP por 5 segundos
     if (digitalRead(BTN_UP) == LOW) {
@@ -221,6 +235,7 @@ void loop() {
   else if (modoMenu > 0) {
     telaAjusteHora(); 
   } 
+
   else {
     if (telaTemporariaAtiva > 0) {
       if (millis() - tempoExibicaoTela > 3000) {
@@ -250,6 +265,21 @@ void loop() {
     
     atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
     controlarNivelAgua();   // Avalia a histerese da válvula
+}
+// --- CICLO TÉRMICO (A cada 30 Segundos) ---
+  if (millis() - ultimoCicloTemp >= 30000) { 
+    ultimoCicloTemp = millis(); 
+    
+    float tempAtual = rtc.getTemperature(); 
+    
+    // Trava e destrava com histerese
+    if (tempAtual >= TEMP_CRITICA) {
+      erroSuperaquecimento = true;
+    } 
+    else if (tempAtual <= TEMP_RECUPERACAO) {
+      erroSuperaquecimento = false;
+    }
+  }
 }
 //======================================================================================
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
@@ -330,10 +360,15 @@ void controlarLuz() {
     indiceLinearPWM = 0;
   }
 
-  indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
+ indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
-  aplicarPWMSeguro(PINO_DIMMER, pwmAtualGlobal); //soft-start adicionado
-  //analogWrite(PINO_DIMMER, pwmAtualGlobal); // removido do codigo original
+  
+  // INTERLOCK TÉRMICO: Sobrepõe o cronograma se a placa estiver em perigo
+  if (erroSuperaquecimento) {
+    pwmAtualGlobal = 0; 
+  }
+
+  aplicarPWMSeguro(PINO_DIMMER, pwmAtualGlobal); // Executa o corte via soft-start
   estadoLuz = (pwmAtualGlobal > 0);
 }
 //========================================================================================
@@ -429,6 +464,7 @@ void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
 }
 
 void gerenciarMenuAjuste() {
+  if (erroSuperaquecimento) return; // Bloqueia a interface se a placa superaquecer
   if (erroBombaTravada) return; // Bloqueia a lógica invisível de ajuste, sai da funcao de ajuste se a bomba travar por estouro de tempo
   static unsigned long tempoInicioSegurarMenu = 0;
   static bool salvamentoExecutado = false;
