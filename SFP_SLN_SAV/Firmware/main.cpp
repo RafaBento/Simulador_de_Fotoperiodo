@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.0
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.1
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -23,8 +23,8 @@
 #define ENDERECO_PCF_LEDS 0x26 
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
-const int DISTANCIA_TANQUE_VAZIO = 100; // cm (Ajustar em campo)
-const int DISTANCIA_TANQUE_CHEIO = 10;  // cm (Ajustar em campo)
+const int DISTANCIA_TANQUE_VAZIO = 45; // cm (Ajustar em campo)
+const int DISTANCIA_TANQUE_CHEIO = 15;  // cm (Ajustar em campo)
 const unsigned long tempoDebounce = 50; 
 
 #define EEPROM_INIT_CODE 0x42 
@@ -66,7 +66,7 @@ bool valvulaLigada = false;
 
 // --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
 unsigned long tempoBombaLigada = 0;
-const unsigned long TEMPO_MAXIMO_BOMBA = 600000; // 10 minutos em milissegundos (ajustar em campo)
+const unsigned long TEMPO_MAXIMO_BOMBA = 10000; // x minutos em milissegundos (ajustar em campo)
 bool erroBombaTravada = false; // FLAG DE ERRO
 
 
@@ -197,7 +197,7 @@ void loop() {
   static unsigned long tempoSegurandoUP = 0;
 
   if (erroBombaTravada) {
-    telaErroBomba();
+    telaErroBomba(); // Esconde a tela principal
     
     // Lógica para rearmar segurando o botão UP por 5 segundos
     if (digitalRead(BTN_UP) == LOW) {
@@ -323,8 +323,10 @@ void controlarLuz() {
   }
 
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
+
   pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
-  analogWrite(PINO_DIMMER, pwmAtualGlobal);
+  aplicarPWMSeguro(PINO_DIMMER, pwmAtualGlobal); //soft-start adicionado
+  //analogWrite(PINO_DIMMER, pwmAtualGlobal); // removido do codigo original
   estadoLuz = (pwmAtualGlobal > 0);
 }
 
@@ -364,7 +366,7 @@ void atualizarBarraLEDsCFTV() {
   if (porcentagemAguaGlobal > 90) estadoLeds |= 0b11111111;
 
   Wire.beginTransmission(ENDERECO_PCF_LEDS);
-  Wire.write(~estadoLeds); 
+  Wire.write(~estadoLeds); //Anodo comum
   Wire.endTransmission();
 }
 
@@ -654,4 +656,27 @@ void telaNivelGama() {
   lcd.print("% (");
   lcd.print(pwmAtualGlobal);
   lcd.print(")  "); 
+}
+
+// --- FUNÇÃO GERENCIADORA DE PWM ---
+void aplicarPWMSeguro(byte pinoLuz, byte pwmAlvo) {
+  static byte pwmRealNaPlaca = 0; // Memória do hardware, começa em 0 no boot
+
+  if (pwmAlvo == pwmRealNaPlaca) return; // Se já está no alvo, ignora e economiza CPU
+
+  if (pwmAlvo > pwmRealNaPlaca) {
+    // SUBIDA (Soft-Start)
+    for (int i = pwmRealNaPlaca; i <= pwmAlvo; i++) {
+      analogWrite(pinoLuz, i);
+      delay(5); // 5ms por passo. (0 a 255 leva ~1275ms ou 1,28s)
+      wdt_reset(); // Alimenta o Watchdog para ele não atuar durante o delay
+    }
+  } 
+  else {
+    // DESCIDA (Pode ir direto, pois não gera pico de corrente)
+    analogWrite(pinoLuz, pwmAlvo);
+  }
+
+  // Atualiza o estado real do hardware
+  pwmRealNaPlaca = pwmAlvo; 
 }
