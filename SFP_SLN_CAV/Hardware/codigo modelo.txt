@@ -1,0 +1,3 @@
+SFP= Simulador de Fotoperíodo
+SLN= Sensor de Luz e Nível (Com sensor de Luz e Nível)
+CAV= Com Antivazão (Com sensor de Fluxo)
