@@ -1,23 +1,23 @@
-/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 3.0
- * Hardware: ATmega328P, DS3232, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
+/* * SIMULADOR DE FOTOPERIODO - FP_CS_AV - VERSÃO 4.0
+ * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de vazamento por taxa de variação de nível, sem sensor de fluxo.
  */
-
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
 #include <avr/wdt.h> // Watchdog
+#include <EEPROM.h>  // Memória Não Volátil
 
 // --- MAPEAMENTO DE PINOS ---
-#define PINO_LDR        A0
-#define BTN_MENU        A1  // MENU/AJUSTE
-#define BTN_UP          A2  // UP / Consulta Nível
-#define BTN_DOWN        A3  // DOWN
-#define PINO_DIMMER     3   // Pino PWM
-#define PINO_VALVULA    9   // Relé Válvula
-#define PINO_TRIGGER    10  // Ultrassônico Gatilho
-#define PINO_ECHO       11  // Ultrassônico Retorno
+#define PINO_LDR        A0 // Pino para o LDR
+#define BTN_MENU        A1 // Botão menu
+#define BTN_UP          A2 // Botão UP 
+#define BTN_DOWN        A3 // Botão DOWN
+#define PINO_DIMMER     3  // Pino do PWM
+#define PINO_VALVULA    9  // Pino de ligar a válvula solenóide tipo NA
+#define PINO_TRIGGER    10 // Pino do Sensor de Nível
+#define PINO_ECHO       11 // Pinno do sensor de nível
 
 // Endereço I2C do Módulo PCF8574 extra para LEDs
 #define ENDERECO_PCF_LEDS 0x26 
@@ -26,8 +26,9 @@
 const int DISTANCIA_TANQUE_VAZIO = 100; // cm
 const int DISTANCIA_TANQUE_CHEIO = 10;  // cm
 const int LIMITE_QUEDA_VAZAMENTO = 10;   
+const unsigned long tempoDebounce = 50; 
 
-const unsigned long tempoDebounce = 50; // Tempo em ms para debounce
+#define EEPROM_INIT_CODE 0x42 
 
 // --- TABELA GAMA (Memória Flash) ---
 const uint8_t gamma8[] PROGMEM = {
@@ -59,8 +60,22 @@ unsigned long ultimoCiclo = 0;
 unsigned long ultimoTesteVazamento = 0;
 int distanciaAnterior = 0;
 int porcentagemAguaGlobal = 0; 
+int pwmAtualGlobal = 0; // Armazena o valor do Gama atual (0 a 255)
 bool vazamentoDetectado = false;
 bool estadoLuz = false;
+
+// Variáveis para as Telas "Pop-up" Temporárias (3 segundos)
+byte telaTemporariaAtiva = 0; // 0=Nenhuma, 1=Água, 2=Gama
+unsigned long tempoExibicaoTela = 0;
+
+// Variáveis do Cronograma (Armazenadas em Minutos desde a Meia-Noite)
+int t1_amanhecerIni = 240;   // 04:00 Padrão
+int t2_amanhecerFim = 270;   // 04:30 Padrão
+int t3_diaProporcional = 480;// 08:00 Padrão
+int t4_tarde100 = 960;       // 16:00 Padrão
+int t5_anoitecerIni = 1200;  // 20:00 Padrão
+int t6_anoitecerFim = 1230;  // 20:30 Padrão 
+
 
 // Estados estabilizados dos botões (pós-debounce)
 bool menuPressionado = false;
@@ -102,15 +117,35 @@ void setup() {
     while (1); 
   }
   
-  // --- AJUSTE DE HORA ---
-  // COMENTE ESTA LINHA APÓS O PRIMEIRO UPLOAD!
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  // COMENTAR ESTA LINHA APÓS O PRIMEIRO UPLOAD
+   rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
   // SE O RTC PERDEU A HORA (Bateria acabou)
   if (rtc.lostPower()) {
     lcd.print("Bateria RTC Ruim");
     delay(2000);
     lcd.clear();
+  }
+
+  // --- INICIALIZAÇÃO DA EEPROM ---
+  byte eepromStatus = EEPROM.read(0);
+  if (eepromStatus != EEPROM_INIT_CODE) {
+    // É a primeira vez. Grava os padrões na EEPROM
+    EEPROM.put(1, t1_amanhecerIni);
+    EEPROM.put(3, t2_amanhecerFim);
+    EEPROM.put(5, t3_diaProporcional);
+    EEPROM.put(7, t4_tarde100);
+    EEPROM.put(9, t5_anoitecerIni);
+    EEPROM.put(11, t6_anoitecerFim);
+    EEPROM.write(0, EEPROM_INIT_CODE); // Sela a formatação
+  } else {
+    // Já foi formatado. Lê as configurações salvas do usuário
+    EEPROM.get(1, t1_amanhecerIni);
+    EEPROM.get(3, t2_amanhecerFim);
+    EEPROM.get(5, t3_diaProporcional);
+    EEPROM.get(7, t4_tarde100);
+    EEPROM.get(9, t5_anoitecerIni);
+    EEPROM.get(11, t6_anoitecerFim);
   }
 
   // --- LÓGICA VÁLVULA ---
@@ -131,6 +166,7 @@ void setup() {
   wdt_enable(WDTO_8S);   // Ativa o Watchdog para 8 segundos
 }
 
+
 void loop() {
   wdt_reset(); // Reinicia o Watchdog
   
@@ -144,108 +180,89 @@ void loop() {
   // 2. Processa Lógica do Menu baseada nos cliques estáveis
   gerenciarMenuAjuste();
 
-  // --- ATUALIZAÇÃO DO DISPLAY (MÁQUINA DE ESTADOS) ---
+  // --- MÁQUINA DE ESTADOS DO DISPLAY ---
   if (modoMenu > 0) {
-    telaAjusteHora(); // Tela de Menu tem prioridade
+         telaAjusteHora(); // Tela de Menu tem prioridade
   } else if (vazamentoDetectado) {
-    telaAlarme();      // Alarme tem segunda prioridade
+         telaAlarme();      // Alarme tem segunda prioridade
   } else {
-    // Só mostra nível se botão UP estiver LOW (apertado)
-    telaPrincipal(upPressionado == LOW); 
+    // Telas temporárias de 3 segundos
+    if (telaTemporariaAtiva > 0) {
+      if (millis() - tempoExibicaoTela > 3000) {
+         telaTemporariaAtiva = 0; // Acabou o tempo
+         lcd.clear(); // Limpa a tela para o relógio entrar limpo
+      } else {
+        if (telaTemporariaAtiva == 1) telaNivelAgua();
+        else if (telaTemporariaAtiva == 2) telaNivelGama();
+      }
+    } else {
+         telaPrincipal(); 
+    }
   }
 
-  // --- LÓGICA DE CONTROLE (Roda a cada 1 segundo) ---
   if (millis() - ultimoCiclo > 1000) {
     ultimoCiclo = millis();
     
-    // Só controla luz e verifica vazamento fora do menu
     if (modoMenu == 0) {
       controlarLuz();
-      
-      // Garante que a válvula continua HIGH se não houver vazamento
       if (!vazamentoDetectado) {
-        digitalWrite(PINO_VALVULA, HIGH); 
+        digitalWrite(PINO_VALVULA, LOW); 
       }
     }
-    
-    atualizarBarraLEDsCFTV(); // Tenta atualizar I2C extra (não trava se não houver módulo)
+    atualizarBarraLEDsCFTV(); 
   }
 
-  // --- VERIFICAÇÃO DE VAZAMENTO ---
   if (modoMenu == 0 && (millis() - ultimoTesteVazamento > 10000)) { 
     verificarVazamento();
     ultimoTesteVazamento = millis();
   }
 }
 
-// --- FUNÇÃO DE CONTROLE DE LUZ COM RAMPA GAMA ---
+// --- FOTOPERÍODO E GAMA ---
 void controlarLuz() {
   long minutosAtuais = agora.hour() * 60 + agora.minute();
   long segundosDoDia = minutosAtuais * 60 + agora.second();
 
-  // Constantes de Tempo (Minutos desde a meia-noite)
-  const long T_0400 = 4 * 60;        // 240
-  const long T_0430 = 4 * 60 + 30;   // 270
-  const long T_0800 = 8 * 60;        // 480
-  const long T_1600 = 16 * 60;       // 960
-  const long T_2000 = 20 * 60;       // 1200
-  const long T_2030 = 20 * 60 + 30;  // 1230
-
   int indiceLinearPWM = 0; // De 0 a 255
 
-  // 1. AMANHECER (04:00 às 04:30) - Rampa de Subida Independente
-  if (minutosAtuais >= T_0400 && minutosAtuais < T_0430) {
-    long segundosPassados = segundosDoDia - (T_0400 * 60);
-    long segundosTotaisRampa = 30 * 60; 
+  if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
+    long segundosPassados = segundosDoDia - (t1_amanhecerIni * 60L);
+    long segundosTotaisRampa = (t2_amanhecerFim - t1_amanhecerIni) * 60L; 
     indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 0, 255);
   }
-  
-  // 2. MANHÃ CLARA (04:30 às 08:00) - 100% Independente
-  else if (minutosAtuais >= T_0430 && minutosAtuais < T_0800) {
+  else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     indiceLinearPWM = 255;
   }
-  
-  // 3. HORÁRIO COMERCIAL (08:00 às 16:00) - Proporcional ao LDR
-  else if (minutosAtuais >= T_0800 && minutosAtuais < T_1600) {
+  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     int leituraLDR = analogRead(PINO_LDR);
-    
     // CALIBRAÇÃO DO LDR: ajustar estes valores dependendo se a resistência do sensor aumenta ou diminui no escuro
     const int LDR_ESCURO = 200; 
     const int LDR_CLARO  = 800; 
-    
     int pwmProporcional = map(leituraLDR, LDR_ESCURO, LDR_CLARO, 255, 0);
     indiceLinearPWM = constrain(pwmProporcional, 0, 255);
   }
-  
-  // 4. FIM DE TARDE/INÍCIO DA NOITE (16:00 às 20:00) - 100% Independente
-  else if (minutosAtuais >= T_1600 && minutosAtuais < T_2000) {
+  else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
     indiceLinearPWM = 255;
   }
-  
-  // 5. ANOITECER (20:00 às 20:30) - Rampa de Descida Independente
-  else if (minutosAtuais >= T_2000 && minutosAtuais < T_2030) {
-    long segundosPassados = segundosDoDia - (T_2000 * 60);
-    long segundosTotaisRampa = 30 * 60;
-    indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 255, 0); // Invertido
+  else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
+    long segundosPassados = segundosDoDia - (t5_anoitecerIni * 60L);
+    long segundosTotaisRampa = (t6_anoitecerFim - t5_anoitecerIni) * 60L;
+    indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 255, 0); 
   }
-  
-  // 6. MADRUGADA (20:30 às 04:00) - Desligado
   else {
     indiceLinearPWM = 0;
   }
 
-  // Trava de segurança e aplicação da Tabela Gama
   indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-
-  // Lê o valor corrigido direto da memória Flash (PROGMEM)
-  int valorPWMCorrigido = pgm_read_byte(&gamma8[indiceLinearPWM]);
-
-  analogWrite(PINO_DIMMER, valorPWMCorrigido);     // Aplica o PWM no pino do MOSFET
-
-  estadoLuz = (valorPWMCorrigido > 0);   // Atualiza o status para o display LCD
+  
+  // Salva o valor atual na variável Global para o Visor ler
+  pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
+  
+  analogWrite(PINO_DIMMER, pwmAtualGlobal);
+  estadoLuz = (pwmAtualGlobal > 0);
 }
 
-
+// --- ROTINAS DE HARDWARE E SENSORES ---
 int lerUltrassonicoEstavel() {
   long soma = 0;
   for(int i=0; i<3; i++) {
@@ -273,13 +290,13 @@ void verificarVazamento() {
   if (diferenca > LIMITE_QUEDA_VAZAMENTO) {  // Se a água desceu (distância aumentou) mais que o limite
     vazamentoDetectado = true;
 
-    digitalWrite(PINO_VALVULA, LOW);         // Desliga a bomba
+    digitalWrite(PINO_VALVULA, HIGH);         // Liga a válvula
   } else {
     distanciaAnterior = distanciaAtual;      // Atualiza referência se variação normal
   }
 }
 
-// ---  ROTINA DE DEBOUNCE VIA SOFTWARE ---
+// --- BOTÕES E MENU INTELIGENTE ---
 void processarDebounceBotoes() {
   // Variáveis estáticas para guardar estado entre execuções do loop
   static unsigned long tempoUltimaMudancaMENU = 0;
@@ -337,66 +354,172 @@ void processarDebounceBotoes() {
   ultimoEstadoCruDOWN = leituraAtualDOWN;
 }
 
-// --- FUNÇÕES DE INTERFACE (MENU USANDO CLICKS ESTÁVEIS) ---
+// Função utilitária para ajustar as variáveis de tempo (em passos de 5 min) para horarios dos periodos
+void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
+  if (aumenta) variavelTempo += 5;
+  else variavelTempo -= 5;
+  if (variavelTempo > 1439) variavelTempo = 0;
+  if (variavelTempo < 0) variavelTempo = 1425;
+}
 
+// --- FUNÇÕES DE INTERFACE (MENU USANDO CLICKS ESTÁVEIS) ---
 void gerenciarMenuAjuste() {
 
   // Lógica para Resetar Alarme (Segurar MENU por 3 segundos pós-debounce)
   static unsigned long tempoInicioSegurarMenu = 0;
+
   if (vazamentoDetectado) {
-    if (menuPressionado == LOW) { // Segurando estabilizado
+    if (menuPressionado == LOW) {    // Segurando estabilizado
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 3000) {
         // RESETAR ALARME E VÁLVULA
         vazamentoDetectado = false;
-        digitalWrite(PINO_VALVULA, HIGH); // Volta a liga a bomba
+        digitalWrite(PINO_VALVULA, LOW); // Volta a desligar a válvula
         distanciaAnterior = lerUltrassonicoEstavel(); 
         lcd.clear();
         lcd.print("ALARME RESETADO");
         delay(1000);
         lcd.clear();
         tempoInicioSegurarMenu = 0;
-        return;
       }
     } else {
       tempoInicioSegurarMenu = 0;
     }
+    return; // Impede entrar no menu se estiver em alarme
   }
 
-  if (vazamentoDetectado) return;   // Se houver Alarme ativo, ignora o menu de ajuste de hora
-
-  // Lógica de navegação do Menu (cliques únicos)
-  if (menuFoiClicado) {
-    lcd.clear(); // Limpa a tela
-    modoMenu++;
-    if (modoMenu > 2) {
-      rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0)); // Salva no RTC
-      modoMenu = 0;
-      lcd.print("HORA SALVA!");
-      delay(1000);
-      lcd.clear();
-    } else if (modoMenu == 1) {
-      horaAjuste = agora.hour();
-      minutoAjuste = agora.minute();
+  // 2. TELA PRINCIPAL
+  if (modoMenu == 0) {
+    
+    // ENTRAR NO MENU (Segurar 3s)
+    if (menuPressionado == LOW) {
+      if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
+      if ((millis() - tempoInicioSegurarMenu) > 3000) {
+        lcd.clear();
+        modoMenu = 1;
+        horaAjuste = agora.hour();
+        minutoAjuste = agora.minute();
+        tempoInicioSegurarMenu = 0;
+        menuFoiClicado = false; // "Consome" o clique para não pular tela
+      }
+    } else {
+      tempoInicioSegurarMenu = 0;
     }
-  }
 
-  // Gerenciar ações dentro do Menu usando cliques estabilizados
-  if (modoMenu == 1) { // Ajuste da hora
-
-    if (upFoiClicado) horaAjuste++; 
-    if (downFoiClicado) horaAjuste--; 
-    if (horaAjuste > 23) horaAjuste = 0;
-    if (horaAjuste < 0) horaAjuste = 23;
+    // GATILHOS DAS TELAS TEMPORÁRIAS (Apenas 1 clique)
+    if (upFoiClicado) {
+      telaTemporariaAtiva = 1; // Tela Água
+      tempoExibicaoTela = millis();
+      lcd.clear();
+    }
+    if (downFoiClicado) {
+      telaTemporariaAtiva = 2; // Tela Gama
+      tempoExibicaoTela = millis();
+      lcd.clear();
+    }
   } 
-  else if (modoMenu == 2) { // Ajuste dos minutos
+  
+  // 3. DENTRO DO MENU
+  else {
+    // Avançar Telas (1 clique simples)
+    if (menuFoiClicado) {
+      lcd.clear(); 
+      modoMenu++;
+      if (modoMenu > 8) {
+        // SALVAR E SAIR
+        rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
+        EEPROM.put(1, t1_amanhecerIni);
+        EEPROM.put(3, t2_amanhecerFim);
+        EEPROM.put(5, t3_diaProporcional);
+        EEPROM.put(7, t4_tarde100);
+        EEPROM.put(9, t5_anoitecerIni);
+        EEPROM.put(11, t6_anoitecerFim);
+        modoMenu = 0;
+        lcd.print("TUDO SALVO!");
+        delay(1000);
+        lcd.clear();
+      }
+    }
 
-    if (upFoiClicado) minutoAjuste++; 
-    if (downFoiClicado) minutoAjuste--; 
-    if (minutoAjuste > 59) minutoAjuste = 0;
-    if (minutoAjuste < 0) minutoAjuste = 59;
+  // --- NAVEGAÇÃO DOS 8 ESTADOS DO MENU ---
+  if (modoMenu == 1) { 
+    if (upFoiClicado) { horaAjuste++; if(horaAjuste > 23) horaAjuste = 0; }
+    if (downFoiClicado) { horaAjuste--; if(horaAjuste < 0) horaAjuste = 23; }
+  } else if (modoMenu == 2) { 
+    if (upFoiClicado) { minutoAjuste++; if(minutoAjuste > 59) minutoAjuste = 0; }
+    if (downFoiClicado) { minutoAjuste--; if(minutoAjuste < 0) minutoAjuste = 59; }
+  } else if (modoMenu == 3) { // T1
+    if (upFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, true);
+    if (downFoiClicado) ajustarVariavelTempo(t1_amanhecerIni, false);
+  } else if (modoMenu == 4) { // T2
+    if (upFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, true);
+    if (downFoiClicado) ajustarVariavelTempo(t2_amanhecerFim, false);
+  } else if (modoMenu == 5) { // T3
+    if (upFoiClicado) ajustarVariavelTempo(t3_diaProporcional, true);
+    if (downFoiClicado) ajustarVariavelTempo(t3_diaProporcional, false);
+  } else if (modoMenu == 6) { // T4
+    if (upFoiClicado) ajustarVariavelTempo(t4_tarde100, true);
+    if (downFoiClicado) ajustarVariavelTempo(t4_tarde100, false);
+  } else if (modoMenu == 7) { // T5
+    if (upFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, true);
+    if (downFoiClicado) ajustarVariavelTempo(t5_anoitecerIni, false);
+  } else if (modoMenu == 8) { // T6
+    if (upFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, true);
+    if (downFoiClicado) ajustarVariavelTempo(t6_anoitecerFim, false);
   }
 }
+}
+// --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
+
+// Função utilitária para desenhar HH:MM a partir de minutos totais
+void printHoraFormatada(int minutosTotais) {
+  int h = minutosTotais / 60;
+  int m = minutosTotais % 60;
+  if(h < 10) lcd.print('0');
+  lcd.print(h);
+  lcd.print(':');
+  if(m < 10) lcd.print('0');
+  lcd.print(m);
+}
+
+void telaAjusteHora() {
+  lcd.backlight(); 
+  lcd.setCursor(0, 0);
+  
+  if (modoMenu == 1 || modoMenu == 2) lcd.print("AJUSTAR RELOGIO ");
+  else if (modoMenu == 3) lcd.print("1.AMANHECER INI ");
+  else if (modoMenu == 4) lcd.print("2.AMANHECER FIM ");
+  else if (modoMenu == 5) lcd.print("3.LIGAR SENSOR   ");
+  else if (modoMenu == 6) lcd.print("4.LUZ 100% TARDE");
+  else if (modoMenu == 7) lcd.print("5.ANOITECER INI ");
+  else if (modoMenu == 8) lcd.print("6.ANOITECER FIM ");
+  
+  lcd.setCursor(0, 1);
+  lcd.print("HORA: ");
+  bool pisca = ((millis() / 300) % 2 == 0);
+
+  if (modoMenu == 1 || modoMenu == 2) {
+    if (modoMenu == 1 && pisca) lcd.print("  ");
+    else { if(horaAjuste < 10) lcd.print('0'); lcd.print(horaAjuste); }
+    lcd.print(':');
+    if (modoMenu == 2 && pisca) lcd.print("  ");
+    else { if(minutoAjuste < 10) lcd.print('0'); lcd.print(minutoAjuste); }
+  } 
+  else {
+    // Exibe os horários do cronograma piscando
+    if (pisca) lcd.print("     ");
+    else {
+      if (modoMenu == 3) printHoraFormatada(t1_amanhecerIni);
+      else if (modoMenu == 4) printHoraFormatada(t2_amanhecerFim);
+      else if (modoMenu == 5) printHoraFormatada(t3_diaProporcional);
+      else if (modoMenu == 6) printHoraFormatada(t4_tarde100);
+      else if (modoMenu == 7) printHoraFormatada(t5_anoitecerIni);
+      else if (modoMenu == 8) printHoraFormatada(t6_anoitecerFim);
+    }
+  }
+  lcd.print("     "); 
+}
+
 
 void atualizarBarraLEDsCFTV() {
   int dist = lerUltrassonicoEstavel();
@@ -408,51 +531,54 @@ void atualizarBarraLEDsCFTV() {
   Wire.endTransmission();
 }
 
-// --- FUNÇÕES DE TELA (LCD COM FORMATAÇÃO FIXA) ---
 
-void telaPrincipal(bool mostrarNivel) {
-  // Atualização da troca de tela (cm) sem usar lcd.clear()
-  static bool ultimaVezMostrouNivel = false;
-  if (!mostrarNivel && ultimaVezMostrouNivel) {
-    lcd.setCursor(0, 1);
-    lcd.print("                "); // Limpa a linha 2
-  }
-  ultimaVezMostrouNivel = mostrarNivel;
+void telaPrincipal() {
+  lcd.setCursor(0, 0);
+  if(agora.hour() < 10) lcd.print('0');
+  lcd.print(agora.hour());
+  lcd.print(':');
+  if(agora.minute() < 10) lcd.print('0');
+  lcd.print(agora.minute());
+  lcd.print(':');
+  if(agora.second() < 10) lcd.print('0'); 
+  lcd.print(agora.second());
+  
+  lcd.print("  "); 
+  lcd.setCursor(10, 0);
+  lcd.print("Luz:");
+  if(estadoLuz) lcd.print("ON ");
+  else lcd.print("OFF");
 
-  if (mostrarNivel) {
-    // Tela Temporária de Nível (Segurando UP)
-    lcd.setCursor(0, 0);
-    lcd.print("NIVEL DO TANQUE "); // 16 caracteres 
-    lcd.setCursor(0, 1);
-    lcd.write(0);                  // Gota
-    lcd.print(" ");
-    if(porcentagemAguaGlobal < 100) lcd.print(" "); // Alinhamento
-    if(porcentagemAguaGlobal < 10) lcd.print(" ");  // Alinhamento
-    lcd.print(porcentagemAguaGlobal);
-    lcd.print("%          ");                       // Espaços para limpar final da linha antiga
-  } 
-  else {
-    // Tela Padrão de Relógio
-    lcd.setCursor(0, 0);
-    if(agora.hour() < 10) lcd.print('0');          // Limpa o meio da linha com espaços
-    lcd.print(agora.hour());
-    lcd.print(':');
-    if(agora.minute() < 10) lcd.print('0');
-    lcd.print(agora.minute());
-    lcd.print(':');
-    if(agora.second() < 10) lcd.print('0');        // Adicionado segundos para ver rodar
-    lcd.print(agora.second());
-    
-    lcd.print("    ");     // Limpa o meio da linha com espaços
+  lcd.setCursor(0, 1);
+  lcd.print("Status: OK      "); 
+}
 
-    lcd.setCursor(10, 0);
-    lcd.print("Luz:");
-    if(estadoLuz) lcd.print("ON ");
-    else lcd.print("OFF");
+void telaNivelAgua() {
+  lcd.setCursor(0, 0);
+  lcd.print("NIVEL DO TANQUE "); 
+  lcd.setCursor(0, 1);
+  lcd.write(0); 
+  lcd.print(" ");
+  if(porcentagemAguaGlobal < 100) lcd.print(" "); 
+  if(porcentagemAguaGlobal < 10) lcd.print(" ");  
+  lcd.print(porcentagemAguaGlobal);
+  lcd.print("%          "); 
+}
 
-    lcd.setCursor(0, 1);
-    lcd.print("Status: OK      "); 
-  }
+void telaNivelGama() {
+  lcd.setCursor(0, 0);
+  lcd.print("NIVEL DE LUZ    "); 
+  lcd.setCursor(0, 1);
+  lcd.print("PWM: ");
+  
+  // Calcula uma % rápida só para visualização na tela
+  int percLuz = map(pwmAtualGlobal, 0, 255, 0, 100);
+  if (percLuz < 100) lcd.print(" "); 
+  if (percLuz < 10) lcd.print(" ");  
+  lcd.print(percLuz);
+  lcd.print("% (");
+  lcd.print(pwmAtualGlobal); // Valor bruto 0-255 enviado ao pino
+  lcd.print(")  "); 
 }
 
 void telaAlarme() {
@@ -464,33 +590,4 @@ void telaAlarme() {
   // Pisca Backlight usando millis
   if ((millis() / 500) % 2 == 0) lcd.noBacklight();
   else lcd.backlight();
-}
-
-void telaAjusteHora() {
-  lcd.backlight(); // Garante luz acesa no menu
-  lcd.setCursor(0, 0);
-  lcd.print("MENU: AJUSTAR   ");
-  
-  lcd.setCursor(0, 1);
-  lcd.print("HORA: ");
-  
-  bool pisca = ((millis() / 300) % 2 == 0);
-
-  // Campo Hora
-  if (modoMenu == 1 && pisca) lcd.print("  ");
-  else {
-    if(horaAjuste < 10) lcd.print('0');
-    lcd.print(horaAjuste);
-  }
-  
-  lcd.print(':');
-  
-  // Campo Minuto
-  if (modoMenu == 2 && pisca) lcd.print("  ");
-  else {
-    if(minutoAjuste < 10) lcd.print('0');
-    lcd.print(minutoAjuste);
-  }
-  
-  lcd.print("     "); // Limpa final da linha
 }
