@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.4
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.0
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -14,8 +14,8 @@
 #define BTN_MENU        A1    // Botão menu
 #define BTN_UP          A2    // Botão UP 
 #define BTN_DOWN        A3    // Botão DOWN
-#define PINO_DIMMER     3     // Pino do PWM
-#define PINO_VALVULA    9     // Pino de ligar a bomba
+#define PINO_DIMMER     9     // Pino do PWM
+#define PINO_VALVULA    3     // Pino de ligar a bomba
 #define PINO_TRIGGER    10    // Pino do Sensor de Nível
 #define PINO_ECHO       11    // Pino do sensor de nível
 
@@ -36,26 +36,6 @@ const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 #define EEPROM_INIT_CODE 0x42 
 #define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
 #define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continue travado evitando que a bomba ligue
-
-// --- TABELA GAMA (Memória Flash) ---
-const uint8_t gamma8[] PROGMEM = {
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
-    0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  1,  1,  1,
-    1,  1,  1,  1,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  2,  2,
-    2,  3,  3,  3,  3,  3,  3,  3,  4,  4,  4,  4,  4,  5,  5,  5,
-    5,  6,  6,  6,  6,  7,  7,  7,  7,  8,  8,  8,  9,  9,  9, 10,
-   10, 10, 11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 15, 15, 16, 16,
-   17, 17, 18, 18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 24, 24, 25,
-   25, 26, 27, 27, 28, 29, 29, 30, 31, 32, 32, 33, 34, 35, 35, 36,
-   37, 38, 39, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 50,
-   51, 52, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 66, 67, 68,
-   69, 70, 72, 73, 74, 75, 77, 78, 79, 81, 82, 83, 85, 86, 87, 89,
-   90, 92, 93, 95, 96, 98, 99,101,102,104,105,107,109,110,112,114,
-  115,117,119,120,122,124,126,127,129,131,133,135,137,138,140,142,
-  144,146,148,150,152,154,156,158,160,162,164,167,169,171,173,175,
-  177,180,182,184,186,189,191,193,196,198,200,203,205,208,210,213,
-  215,218,220,223,225,228,231,233,236,239,241,244,247,249,252,255
-};
 
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
@@ -108,10 +88,21 @@ byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; //apenas para enfeite 
 
 void setup() {
   pinMode(PINO_DIMMER, OUTPUT);
+
+// Limpeza dos registradores
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+// PWM, Modo 14 (TOP = ICR1) | Saída não-invertida no pino 9 (COM1A1)
+  TCCR1A = (1 << COM1A1) | (1 << WGM11);
+  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // Prescaler = 1 (Frequência máxima)
+  ICR1 = 32767; // Define o teto (TOP) gerando 488 Hz exatos
+  OCR1A = 0;    // Inicia com ciclo de trabalho em 0% (Luz apagada)
+
   pinMode(PINO_VALVULA, OUTPUT);
   pinMode(PINO_TRIGGER, OUTPUT);
   pinMode(PINO_ECHO, INPUT);
-  
+
   pinMode(BTN_MENU, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
@@ -153,7 +144,6 @@ void setup() {
 
   digitalWrite(PINO_VALVULA, LOW); 
   valvulaLigada = false;
-  analogWrite(PINO_DIMMER, 0);     
   
   lcd.setCursor(0,0);
   lcd.print("SISTEMA INICIADO");
@@ -313,63 +303,49 @@ void controlarNivelAgua() {
 void controlarLuz() {
   long minutosAtuais = agora.hour() * 60 + agora.minute();
   long segundosDoDia = minutosAtuais * 60 + agora.second();
-  int indiceLinearPWM = 0; 
+  
+  float progresso = 0.0; 
+  uint16_t pwmAlvo = 0;
 
   if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
-    long segundosPassados = segundosDoDia - (t1_amanhecerIni * 60L);
-    long segundosTotaisRampa = (t2_amanhecerFim - t1_amanhecerIni) * 60L; 
-    indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 0, 255);
+    long segPassados = segundosDoDia - (t1_amanhecerIni * 60L);
+    long segTotais = (t2_amanhecerFim - t1_amanhecerIni) * 60L;
+    progresso = (float)segPassados / segTotais; // Vai de 0.0 a 1.0 suavemente
+    // Calcula a curva Gama em tempo real e joga pra escala de 15 bits
+    pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
   }
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
-    indiceLinearPWM = 255;
+    pwmAlvo = 32767;
   }
   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
-      static float pwmIntegrativo = 255; 
-      static unsigned long tempoUltimaAcao = millis();
-
-      const int ALVO_LDR = 400;   
-      const int JANELA = 80;      
-
-      if (millis() - tempoUltimaAcao >= 100) { 
-        int leituraLDR = analogRead(PINO_LDR);
-        
-        if (leituraLDR < (ALVO_LDR - JANELA)) pwmIntegrativo += 0.5; 
-        else if (leituraLDR > (ALVO_LDR + JANELA)) pwmIntegrativo -= 0.5; 
-
-        if (pwmIntegrativo > 255) pwmIntegrativo = 255;
-        if (pwmIntegrativo < 0) pwmIntegrativo = 0;
-        
-        tempoUltimaAcao = millis();
-      }
-      indiceLinearPWM = (int)pwmIntegrativo;
-    } 
-    else {
-      indiceLinearPWM = 0; 
+       // A lógica do LDR aqui, adaptada para a escala 0-32767
+       pwmAlvo = 32767; 
+    } else {
+       pwmAlvo = 0;
     }
   }
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
-    indiceLinearPWM = 255;
+    pwmAlvo = 32767;
   }
   else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
-    long segundosPassados = segundosDoDia - (t5_anoitecerIni * 60L);
-    long segundosTotaisRampa = (t6_anoitecerFim - t5_anoitecerIni) * 60L;
-    indiceLinearPWM = map(segundosPassados, 0, segundosTotaisRampa, 255, 0); 
-  }
-  else {
-    indiceLinearPWM = 0;
+    long segPassados = segundosDoDia - (t5_anoitecerIni * 60L);
+    long segTotais = (t6_anoitecerFim - t5_anoitecerIni) * 60L;
+    progresso = 1.0 - ((float)segPassados / segTotais); // Decresce de 1.0 a 0.0
+    pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
   }
 
- indiceLinearPWM = constrain(indiceLinearPWM, 0, 255);
-  pwmAtualGlobal = pgm_read_byte(&gamma8[indiceLinearPWM]);
-  
-  // INTERLOCK TÉRMICO: Sobrepõe o cronograma se a placa estiver em perigo
-  if (erroSuperaquecimento) {
-    pwmAtualGlobal = 0; 
-  }
+  // INTERLOCK TÉRMICO
+  if (erroSuperaquecimento) pwmAlvo = 0;
 
-  aplicarPWMSeguro(PINO_DIMMER, pwmAtualGlobal); // Executa o corte via soft-start
-  estadoLuz = (pwmAtualGlobal > 0);
+  // PISO DE SOFTWARE (O truque do TLP250)
+  // 1 tick = 62,5ns. TLP250 precisa de 500ns = 8 ticks.
+  // Se o PWM for maior que zero, mas não tiver força pra ligar o driver, pula pro 8.
+  if (pwmAlvo > 0 && pwmAlvo < 8) pwmAlvo = 8; 
+
+  aplicarPWMSeguro(pwmAlvo); 
+  estadoLuz = (pwmAlvo > 0);
+  pwmAtualGlobal = pwmAlvo;
 }
 //========================================================================================
 // --- HARDWARE E SENSORES ---
@@ -700,38 +676,45 @@ void telaNivelGama() {
   lcd.setCursor(0, 0);
   lcd.print(" NIVEL DE LUZ:  "); 
   lcd.setCursor(0, 1);
-  lcd.print(" PWM:");
+  lcd.print("PWM:");
   
-  int percLuz = map(pwmAtualGlobal, 0, 255, 0, 100);
+  // Atualizado para a nova escala do Timer 1 (15 bits)
+  int percLuz = map(pwmAtualGlobal, 0, 32767, 0, 100);
+  
   if (percLuz < 100) lcd.print(" "); 
   if (percLuz < 10) lcd.print(" ");  
   lcd.print(percLuz);
-  lcd.print("% (");
-  lcd.print(pwmAtualGlobal);
-  lcd.print(")  "); 
+  lcd.print("% ");
+  
+  // Formatacao dinamica para caber numeros de 1 a 5 digitos sem estourar a tela
+  if (pwmAtualGlobal < 10000) lcd.print(" ");
+  if (pwmAtualGlobal < 1000) lcd.print(" ");
+  if (pwmAtualGlobal < 100) lcd.print(" ");
+  if (pwmAtualGlobal < 10) lcd.print(" ");
+  lcd.print(pwmAtualGlobal); 
 }
 
 //=========================================================================================================================================
 
 // --- FUNÇÃO GERENCIADORA DE PWM (SOFTSTART) ---
-void aplicarPWMSeguro(byte pinoLuz, byte pwmAlvo) {
-  static byte pwmRealNaPlaca = 0; // Memória do hardware, começa em 0 no boot
-
-  if (pwmAlvo == pwmRealNaPlaca) return; // Se já está no alvo, ignora e economiza CPU
+void aplicarPWMSeguro(uint16_t pwmAlvo) {
+  static uint16_t pwmRealNaPlaca = 0; 
+  if (pwmAlvo == pwmRealNaPlaca) return;
 
   if (pwmAlvo > pwmRealNaPlaca) {
-    // SUBIDA (Soft-Start)
-    for (int i = pwmRealNaPlaca; i <= pwmAlvo; i++) {
-      analogWrite(pinoLuz, i);
-      delay(5); // 5ms por passo. (0 a 255 leva ~1275ms ou 1,28s)
-      wdt_reset(); // Alimenta o Watchdog para ele não atuar durante o delay
+    // Calcula um salto de aceleração. Se pular de 0 a 100%, faz em ~1.5 seg
+    uint16_t salto = (pwmAlvo - pwmRealNaPlaca) / 100;
+    if (salto < 1) salto = 1;
+
+    for (uint16_t i = pwmRealNaPlaca; i <= pwmAlvo; i += salto) {
+      OCR1A = i; // Escreve direto no registrador de hardware do Pino 9
+      delay(15); 
+      wdt_reset(); 
+      if (pwmAlvo - i < salto) break; // Trava de precisão para o último loop
     }
   } 
-  else {
-    // DESCIDA (Pode ir direto, pois não gera pico de corrente)
-    analogWrite(pinoLuz, pwmAlvo);
-  }
-
-  // Atualiza o estado real do hardware
+  
+  // Confirmação final exata
+  OCR1A = pwmAlvo;
   pwmRealNaPlaca = pwmAlvo; 
 }
