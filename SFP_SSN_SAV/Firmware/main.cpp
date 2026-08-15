@@ -641,6 +641,6 @@ void executarSalvamento() {
   lcd.clear();
   lcd.print("ALTERACAO  SALVA");
   lcd.setCursor(0, 1);
-  lcd.print("  COM SUCESSO! :)");
+  lcd.print(" COM SUCESSO! :)");
   delay(2000);
 }
