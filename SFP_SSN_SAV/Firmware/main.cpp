@@ -1,45 +1,32 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.1
- * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
- * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
+/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSÃO 1.0
+ * Hardware: ATmega328P, DS3231, LCD I2C, Relé, IRF3205.
  */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
 #include <avr/wdt.h> // Watchdog
-#include <EEPROM.h>  // Memória Não Volátil
+#include <EEPROM.h>  // Memoria Nao Volátil
 
-// --- LISTA DE FUNCOES ---
+// LISTA DE FUNCOES
 void processarDebounceBotoes();
 void gerenciarMenuAjuste();
-void telaErroBomba();
 void telaAjusteHora();
-void telaNivelAgua();
 void telaNivelGama();
 void telaPrincipal();
 void controlarLuz();
-void atualizarBarraLEDsCFTV();
-void controlarNivelAgua();
 void aplicarPWMSeguro(uint16_t pwmValue); 
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
 
-// --- MAPEAMENTO DE PINOS ---
+// MAPEAMENTO DE PINOS
 #define PINO_LDR        A0    // Pino para o LDR
 #define BTN_MENU        A1    // Botão menu
 #define BTN_UP          A2    // Botão UP 
 #define BTN_DOWN        A3    // Botão DOWN
 #define PINO_DIMMER     9     // Pino do PWM
-#define PINO_VALVULA    3     // Pino de ligar a bomba
-#define PINO_TRIGGER    10    // Pino do Sensor de Nível
-#define PINO_ECHO       11    // Pino do sensor de nível
-
-// Endereço I2C do Módulo PCF8574 extra para LEDs
-#define ENDERECO_PCF_LEDS 0x26 
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
-const int DISTANCIA_TANQUE_VAZIO = 30; // cm (Ajustar em campo)
-const int DISTANCIA_TANQUE_CHEIO = 14;  // cm (Ajustar em campo)
 const unsigned long tempoDebounce = 50; 
 
 // --- VARIÁVEIS DE SEGURANÇA TÉRMICA ---
@@ -50,7 +37,6 @@ const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 
 #define EEPROM_INIT_CODE 0x42 
 #define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
-#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continuar travado evitando que a bomba ligue
 
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
@@ -59,18 +45,9 @@ RTC_DS3231 rtc;
 // --- VARIÁVEIS GLOBAIS ---
 DateTime agora;
 unsigned long ultimoCicloLuz = 0;         // Cronômetro para a Luz (1s)
-unsigned long ultimoCicloUltrassom = 0;   // Cronômetro para o Ultrassom/Bomba (5s)
 
-int porcentagemAguaGlobal = 0; 
 int pwmAtualGlobal = 0; 
 bool estadoLuz = false;
-bool valvulaLigada = false;
-
-// --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
-unsigned long tempoBombaLigada = 0;
-const unsigned long TEMPO_MAXIMO_BOMBA = 420000; // 7 minutos em milissegundos (ajustar em campo)
-bool erroBombaTravada = false; // FLAG DE ERRO
-
 
 // Variáveis: LDR Manual Override
 bool sensorLuzAtivo = true; 
@@ -99,8 +76,6 @@ bool downFoiClicado = false;
 int modoMenu = 0; 
 int horaAjuste, minutoAjuste;
 
-byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; //apenas para enfeite no display
-
 //=================================================================================================
 
 void setup() {
@@ -116,10 +91,6 @@ void setup() {
   ICR1 = 32767; // Define o teto (TOP) gerando 488 Hz exatos
   OCR1A = 0;    // Inicia com ciclo de trabalho em 0% (Luz apagada)
 
-  pinMode(PINO_VALVULA, OUTPUT);
-  pinMode(PINO_TRIGGER, OUTPUT);
-  pinMode(PINO_ECHO, INPUT);
-
   pinMode(BTN_MENU, INPUT_PULLUP);
   pinMode(BTN_UP, INPUT_PULLUP);
   pinMode(BTN_DOWN, INPUT_PULLUP);
@@ -127,7 +98,6 @@ void setup() {
   Wire.begin();
   lcd.init();
   lcd.backlight();
-  lcd.createChar(0, gota);
 
   if (!rtc.begin()) {
     lcd.print("Erro no RTC!");
@@ -147,7 +117,6 @@ void setup() {
     EEPROM.put(11, t6_anoitecerFim);
     
     EEPROM.write(EEPROM_ADDR_LDR, 1); 
-    EEPROM.write(EEPROM_ADDR_ERRO_BOMBA, 0); // 0 = Sem erro de bomba
     EEPROM.write(0, EEPROM_INIT_CODE); 
   } else {
     EEPROM.get(1, t1_amanhecerIni);
@@ -158,11 +127,7 @@ void setup() {
     EEPROM.get(11, t6_anoitecerFim);
     
     sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1;
-    erroBombaTravada = EEPROM.read(EEPROM_ADDR_ERRO_BOMBA) == 1; 
   }
-
-  digitalWrite(PINO_VALVULA, LOW); 
-  valvulaLigada = false;
   
   lcd.setCursor(0,0);
   lcd.print("SISTEMA INICIADO");
@@ -216,7 +181,6 @@ void loop() {
 //=====================================================================================
 
   // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
-  static unsigned long tempoSegurandoUP = 0;
 
   if (erroSuperaquecimento) {
     // Alarme Visual de Calor (Prioridade 1)
@@ -226,37 +190,16 @@ void loop() {
     lcd.print("Luz Desligada!!!");
     modoMenu = 0; // Força a saída de qualquer menu ativo
   }
-  else if (erroBombaTravada) {
-    telaErroBomba(); // Esconde a tela principal (Prioridade 2)
-    
-    // Lógica para rearmar segurando o botão UP por 5 segundos
-    if (digitalRead(BTN_UP) == LOW) {
-      if (tempoSegurandoUP == 0) tempoSegurandoUP = millis();
-      if (millis() - tempoSegurandoUP >= 5000) {
-        erroBombaTravada = false; // Destrava o sistema na RAM
-        EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 0); // Destrava o sistema na EEPROM
-        tempoSegurandoUP = 0;
-        lcd.clear();
-        lcd.print(" BOMBA REARMADA ");
-        delay(2000);
-        lcd.clear();
-      }
-    } else {
-      tempoSegurandoUP = 0; // Zera o cronômetro se soltar o dedo antes
-    }
-  } 
   else if (modoMenu > 0) {
     telaAjusteHora(); 
   } 
-
   else {
     if (telaTemporariaAtiva > 0) {
       if (millis() - tempoExibicaoTela > 3000) {
         telaTemporariaAtiva = 0; 
         lcd.clear(); 
       } else {
-        if (telaTemporariaAtiva == 1) telaNivelAgua();
-        else if (telaTemporariaAtiva == 2) telaNivelGama();
+        if (telaTemporariaAtiva == 1) telaNivelGama();
       }
     } else {
       telaPrincipal(); 
@@ -272,14 +215,6 @@ void loop() {
     }
   }
 
-  // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
-  if (millis() - ultimoCicloUltrassom >= 5000) { 
-    ultimoCicloUltrassom = millis(); 
-    
-    atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
-    controlarNivelAgua();   // Avalia a histerese da válvula
-}
-
 // --- CICLO TÉRMICO (A cada 30 Segundos) ---
   if (millis() - ultimoCicloTemp >= 30000) { 
     ultimoCicloTemp = millis(); 
@@ -292,35 +227,6 @@ void loop() {
     } 
     else if (tempAtual <= TEMP_RECUPERACAO) {
       erroSuperaquecimento = false;
-    }
-  }
-}
-
-//======================================================================================
-
-// --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
-void controlarNivelAgua() {
-  // Intertravamento: A bomba SÓ pode ligar se NÃO houver erro travado na memória
-  if (porcentagemAguaGlobal <= 10 && !valvulaLigada && !erroBombaTravada) {
-    valvulaLigada = true; 
-    tempoBombaLigada = millis(); // Marca a hora exata da partida
-    digitalWrite(PINO_VALVULA, HIGH);
-  } 
-  else if (porcentagemAguaGlobal >= 100 && valvulaLigada) {
-    valvulaLigada = false;
-    digitalWrite(PINO_VALVULA, LOW);  
-  }
-  
-  // FAIL-SAFE: Desliga na marra se estourar o tempo limite
-  if (valvulaLigada && (millis() - tempoBombaLigada > TEMPO_MAXIMO_BOMBA)) {
-    valvulaLigada = false;
-    digitalWrite(PINO_VALVULA, LOW);
-    
-    // Trava o sistema e salva na memória não-volátil (apenas se mudou de estado)
-    if (!erroBombaTravada) {
-      erroBombaTravada = true; 
-      EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 1); 
-      modoMenu = 0; // Força a saída do Menu se estourar o tempo de enchimento da caixa
     }
   }
 }
@@ -345,12 +251,19 @@ void controlarLuz() {
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     pwmAlvo = 32767;
   }
-  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
-       // A logica do LDR (anteriormente em 8 bits), adaptada para a escala 0-32767 (15 bits)
-       pwmAlvo = 32767; 
+       int leituraLDR = analogRead(PINO_LDR);
+       
+       // Mapeamento dinamico: Converte a leitura analogica (0 a 1023) para o PWM de 15 bits (0 a 32767).
+       // Se ambiente ESCURO = leitura ALTA (ex: 1000), o map abaixo deixará a luz 100% no escuro.
+       long pwmMapeado = map(leituraLDR, 2, 993, 32767, 0); 
+       
+       pwmAlvo = constrain(pwmMapeado, 0, 32767); // Trava de segurança para não estourar a variável
     } else {
-       pwmAlvo = 0;
+       // Logica manual: Se desligar o sensor pressionando UP+DOWN, a luz desliga
+       // Se quiser que ela fique 100% ligada ignorando o sol, basta trocar o 0 abaixo por 32767.
+       pwmAlvo = 0; 
     }
   }
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
@@ -374,50 +287,6 @@ void controlarLuz() {
   aplicarPWMSeguro(pwmAlvo); 
   estadoLuz = (pwmAlvo > 0);
   pwmAtualGlobal = pwmAlvo;
-}
-
-//========================================================================================
-
-// --- HARDWARE E SENSORES ---
-int lerUltrassonicoEstavel() {
-  long soma = 0;
-  for(int i=0; i<3; i++) {
-    digitalWrite(PINO_TRIGGER, LOW);
-    delayMicroseconds(2);
-    digitalWrite(PINO_TRIGGER, HIGH);
-    delayMicroseconds(10);
-    digitalWrite(PINO_TRIGGER, LOW);
-    
-    long duracao = pulseIn(PINO_ECHO, HIGH, 30000); 
-    if(duracao == 0) duracao = 30000; 
-    
-    soma += (duracao * 0.034 / 2);
-    delay(10); 
-  }
-  return soma / 3;
-}
-
-//===========================================================================================
-
-void atualizarBarraLEDsCFTV() {
-  int dist = lerUltrassonicoEstavel();
-  porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
-  porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
-  
-  // Converte a porcentagem da agua no preenchimento da Barra de LEDs
-  byte estadoLeds = 0;
-  if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000001; 
-  if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000011;
-  if (porcentagemAguaGlobal > 40) estadoLeds |= 0b00000111;
-  if (porcentagemAguaGlobal > 50) estadoLeds |= 0b00001111;
-  if (porcentagemAguaGlobal > 60) estadoLeds |= 0b00011111;
-  if (porcentagemAguaGlobal > 70) estadoLeds |= 0b00111111;
-  if (porcentagemAguaGlobal > 80) estadoLeds |= 0b01111111;
-  if (porcentagemAguaGlobal > 90) estadoLeds |= 0b11111111;
-
-  Wire.beginTransmission(ENDERECO_PCF_LEDS);
-  Wire.write(~estadoLeds); //Anodo comum
-  Wire.endTransmission();
 }
 
 //==========================================================================================
@@ -478,7 +347,6 @@ void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
 //=========================================================================================================================================
 void gerenciarMenuAjuste() {
   if (erroSuperaquecimento) return; 
-  if (erroBombaTravada) return; 
   static unsigned long tempoInicioSegurarMenu = 0;
   static bool salvamentoExecutado = false;
   static bool ignorarSoltura = false; 
@@ -498,13 +366,8 @@ void gerenciarMenuAjuste() {
       tempoInicioSegurarMenu = 0;
     }
 
-    if (upFoiClicado && !comboPressionado) {
-      telaTemporariaAtiva = 1; 
-      tempoExibicaoTela = millis();
-      lcd.clear();
-    }
     if (downFoiClicado && !comboPressionado) {
-      telaTemporariaAtiva = 2; 
+      telaTemporariaAtiva = 1; 
       tempoExibicaoTela = millis();
       lcd.clear();
     }
@@ -669,38 +532,6 @@ void telaPrincipal() {
   else {
     lcd.print("     Noite      ");
   }
-}
-
-//=========================================================================================================================================
-
-void telaNivelAgua() {
-  lcd.setCursor(0, 0);
-  if (valvulaLigada) lcd.print("ENCHENDO A CAIXA"); 
-  else lcd.print("NIVEL DA CAIXA: "); 
-  
-  lcd.setCursor(0, 1);
-  lcd.write(0); 
-  lcd.print(" ");
-  if(porcentagemAguaGlobal < 100) lcd.print(" "); 
-  if(porcentagemAguaGlobal < 10) lcd.print(" ");  
-  lcd.print(porcentagemAguaGlobal);
-  lcd.print("%          "); 
-}
-
-//=========================================================================================================================================
-
-void telaErroBomba() {
-  lcd.setCursor(0, 0);
-  bool pisca = ((millis() / 2000) % 2 == 0);
-  
-  if (pisca) {
-    lcd.print("TEMPO EXCEDIDO!!");
-  } else {
-    lcd.print("BOMBA DESLIGADA!");
-  }
-  
-  lcd.setCursor(0, 1);
-  lcd.print("SEGURE UP (5s)  ");
 }
 
 //=========================================================================================================================================
