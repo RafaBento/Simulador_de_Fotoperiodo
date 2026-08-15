@@ -1,3 +1,6 @@
+
+.pio/
+
 # Ignorar arquivos de compilacao do Arduino
 *.hex
 *.elf
