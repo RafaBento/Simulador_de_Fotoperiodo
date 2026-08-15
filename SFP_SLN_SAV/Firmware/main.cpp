@@ -345,12 +345,19 @@ void controlarLuz() {
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     pwmAlvo = 32767;
   }
-  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
-       // A logica do LDR (anteriormente em 8 bits), adaptada para a escala 0-32767 (15 bits)
-       pwmAlvo = 32767; 
+       int leituraLDR = analogRead(PINO_LDR);
+       
+       // Mapeamento dinamico: Converte a leitura analogica (0 a 1023) para o PWM de 15 bits (0 a 32767).
+       // Se ambiente ESCURO = leitura ALTA (ex: 1000), o map abaixo deixará a luz 100% no escuro.
+       long pwmMapeado = map(leituraLDR, 2, 993, 32767, 0); 
+       
+       pwmAlvo = constrain(pwmMapeado, 0, 32767); // Trava de segurança para não estourar a variável
     } else {
-       pwmAlvo = 0;
+       // Logica manual: Se desligar o sensor pressionando UP+DOWN, a luz desliga
+       // Se quiser que ela fique 100% ligada ignorando o sol, basta trocar o 0 abaixo por 32767.
+       pwmAlvo = 0; 
     }
   }
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
@@ -810,6 +817,6 @@ void executarSalvamento() {
   lcd.clear();
   lcd.print("ALTERACAO  SALVA");
   lcd.setCursor(0, 1);
-  lcd.print("  COM SUCESSO! :)");
+  lcd.print(" COM SUCESSO! :)");
   delay(2000);
 }
