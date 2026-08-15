@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.0
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.1
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -8,6 +8,21 @@
 #include <RTClib.h>
 #include <avr/wdt.h> // Watchdog
 #include <EEPROM.h>  // Memória Não Volátil
+
+// --- LISTA DE FUNCOES ---
+void processarDebounceBotoes();
+void gerenciarMenuAjuste();
+void telaErroBomba();
+void telaAjusteHora();
+void telaNivelAgua();
+void telaNivelGama();
+void telaPrincipal();
+void controlarLuz();
+void atualizarBarraLEDsCFTV();
+void controlarNivelAgua();
+void aplicarPWMSeguro(uint16_t pwmValue); 
+void executarSalvamento();
+bool validarAvanco(int telaAtual);
 
 // --- MAPEAMENTO DE PINOS ---
 #define PINO_LDR        A0    // Pino para o LDR
@@ -35,7 +50,7 @@ const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 
 #define EEPROM_INIT_CODE 0x42 
 #define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
-#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continue travado evitando que a bomba ligue
+#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continuar travado evitando que a bomba ligue
 
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
@@ -86,6 +101,8 @@ int horaAjuste, minutoAjuste;
 
 byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; //apenas para enfeite no display
 
+//=================================================================================================
+
 void setup() {
   pinMode(PINO_DIMMER, OUTPUT);
 
@@ -116,7 +133,9 @@ void setup() {
     lcd.print("Erro no RTC!");
     while (1); 
   }
+
 //=================================================================================================
+
   // Inicialização EEPROM e Leitura dos Dados
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
@@ -152,7 +171,9 @@ void setup() {
 
   wdt_enable(WDTO_8S);
 }
+
 //============================================================================================================
+
 void loop() {
   wdt_reset(); 
   
@@ -191,7 +212,9 @@ void loop() {
 
   processarDebounceBotoes();
   gerenciarMenuAjuste();
+
 //=====================================================================================
+
   // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
   static unsigned long tempoSegurandoUP = 0;
 
@@ -239,7 +262,7 @@ void loop() {
       telaPrincipal(); 
     }
   }
-//======================================================================================
+
   // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
     ultimoCicloLuz += 1000; // Correção para evitar drift de tempo
@@ -248,7 +271,7 @@ void loop() {
       controlarLuz();
     }
   }
-//======================================================================================
+
   // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
   if (millis() - ultimoCicloUltrassom >= 5000) { 
     ultimoCicloUltrassom = millis(); 
@@ -256,6 +279,7 @@ void loop() {
     atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
     controlarNivelAgua();   // Avalia a histerese da válvula
 }
+
 // --- CICLO TÉRMICO (A cada 30 Segundos) ---
   if (millis() - ultimoCicloTemp >= 30000) { 
     ultimoCicloTemp = millis(); 
@@ -271,7 +295,9 @@ void loop() {
     }
   }
 }
+
 //======================================================================================
+
 // --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
 void controlarNivelAgua() {
   // Intertravamento: A bomba SÓ pode ligar se NÃO houver erro travado na memória
@@ -298,8 +324,10 @@ void controlarNivelAgua() {
     }
   }
 }
+
 //======================================================================================
-// --- FOTOPERÍODO E GAMA ---
+
+// --- FOTOPERIODO E GAMA ---
 void controlarLuz() {
   long minutosAtuais = agora.hour() * 60 + agora.minute();
   long segundosDoDia = minutosAtuais * 60 + agora.second();
@@ -319,7 +347,7 @@ void controlarLuz() {
   }
   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
-       // A lógica do LDR aqui, adaptada para a escala 0-32767
+       // A logica do LDR (anteriormente em 8 bits), adaptada para a escala 0-32767 (15 bits)
        pwmAlvo = 32767; 
     } else {
        pwmAlvo = 0;
@@ -335,19 +363,21 @@ void controlarLuz() {
     pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
   }
 
-  // INTERLOCK TÉRMICO
+  // INTERTRAVAMENTO TERMICO
   if (erroSuperaquecimento) pwmAlvo = 0;
 
-  // PISO DE SOFTWARE (O truque do TLP250)
+  // PISO DE SOFTWARE para o TLP250
   // 1 tick = 62,5ns. TLP250 precisa de 500ns = 8 ticks.
-  // Se o PWM for maior que zero, mas não tiver força pra ligar o driver, pula pro 8.
+  // Se o PWM for maior que zero, mas nao tiver força pra ligar o driver, pula pro 8.
   if (pwmAlvo > 0 && pwmAlvo < 8) pwmAlvo = 8; 
 
   aplicarPWMSeguro(pwmAlvo); 
   estadoLuz = (pwmAlvo > 0);
   pwmAtualGlobal = pwmAlvo;
 }
+
 //========================================================================================
+
 // --- HARDWARE E SENSORES ---
 int lerUltrassonicoEstavel() {
   long soma = 0;
@@ -366,13 +396,15 @@ int lerUltrassonicoEstavel() {
   }
   return soma / 3;
 }
+
 //===========================================================================================
+
 void atualizarBarraLEDsCFTV() {
   int dist = lerUltrassonicoEstavel();
   porcentagemAguaGlobal = map(dist, DISTANCIA_TANQUE_VAZIO, DISTANCIA_TANQUE_CHEIO, 0, 100);
   porcentagemAguaGlobal = constrain(porcentagemAguaGlobal, 0, 100);
   
-  // Converte a porcentagem da água no preenchimento da Barra de LEDs
+  // Converte a porcentagem da agua no preenchimento da Barra de LEDs
   byte estadoLeds = 0;
   if (porcentagemAguaGlobal > 20) estadoLeds |= 0b00000001; 
   if (porcentagemAguaGlobal > 30) estadoLeds |= 0b00000011;
@@ -387,8 +419,10 @@ void atualizarBarraLEDsCFTV() {
   Wire.write(~estadoLeds); //Anodo comum
   Wire.endTransmission();
 }
+
 //==========================================================================================
-// --- BOTÕES E MENU INTELIGENTE ---
+
+// --- BOTOES E MENU INTELIGENTE ---
 void processarDebounceBotoes() {
   static unsigned long tempoUltimaMudancaMENU = 0;
   static unsigned long tempoUltimaMudancaUP = 0;
@@ -432,6 +466,8 @@ void processarDebounceBotoes() {
   ultimoEstadoCruDOWN = leituraAtualDOWN;
 }
 
+//=========================================================================================================================================
+
 void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
   if (aumenta) variavelTempo += 5;
   else variavelTempo -= 5;
@@ -439,9 +475,10 @@ void ajustarVariavelTempo(int &variavelTempo, bool aumenta) {
   if (variavelTempo < 0) variavelTempo = 1425;
 }
 
+//=========================================================================================================================================
 void gerenciarMenuAjuste() {
-  if (erroSuperaquecimento) return; // Bloqueia a interface se a placa superaquecer
-  if (erroBombaTravada) return; // Bloqueia a lógica invisível de ajuste, sai da funcao de ajuste se a bomba travar por estouro de tempo
+  if (erroSuperaquecimento) return; 
+  if (erroBombaTravada) return; 
   static unsigned long tempoInicioSegurarMenu = 0;
   static bool salvamentoExecutado = false;
   static bool ignorarSoltura = false; 
@@ -479,25 +516,25 @@ void gerenciarMenuAjuste() {
       if ((millis() - tempoInicioSegurarMenu) > 1000 && !salvamentoExecutado && !ignorarSoltura) {
         salvamentoExecutado = true; 
         
-        rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
-        EEPROM.put(1, t1_amanhecerIni);
-        EEPROM.put(3, t2_amanhecerFim);
-        EEPROM.put(5, t3_diaProporcional);
-        EEPROM.put(7, t4_tarde100);
-        EEPROM.put(9, t5_anoitecerIni);
-        EEPROM.put(11, t6_anoitecerFim);
+        // LOGICA DE SALVAMENTO RAPIDO
+        bool sucesso = true;
+        while (modoMenu <= 8) {
+          if (!validarAvanco(modoMenu)) {
+            sucesso = false;
+            break; // Acha o erro, quebra o loop e leva exatamente pra tela problematica
+          }
+          modoMenu++;
+        }
+
+        if (sucesso) { // Passou pela varredura em todas as telas ileso
+          executarSalvamento();
+          modoMenu = 0;
+        }
         
-        lcd.clear();
-        lcd.print("ALTERACAO  SALVA");
-        lcd.setCursor(0, 1);
-        lcd.print("  COM SUCESSO!  :)");
-        delay(2000);
-        
-        modoMenu = 0;
         tempoInicioSegurarMenu = 0; 
         menuFoiClicado = false;     
         lcd.clear();
-        return;                     
+        return;                    
       }
     } 
     else { 
@@ -506,30 +543,24 @@ void gerenciarMenuAjuste() {
       } 
       else if (tempoInicioSegurarMenu > 0) {
         unsigned long duracao = millis() - tempoInicioSegurarMenu;
+        
+        // LOGICA DE AVANCO PASSO A PASSO
         if (duracao < 1000 && !salvamentoExecutado) {
-          lcd.clear(); 
-          modoMenu++;
-          if (modoMenu > 8) {
-            rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
-            EEPROM.put(1, t1_amanhecerIni);
-            EEPROM.put(3, t2_amanhecerFim);
-            EEPROM.put(5, t3_diaProporcional);
-            EEPROM.put(7, t4_tarde100);
-            EEPROM.put(9, t5_anoitecerIni);
-            EEPROM.put(11, t6_anoitecerFim);
-            modoMenu = 0;
-            lcd.print("SUAS ALTERACOES ");
-            lcd.setCursor(0, 1);
-            lcd.print("FORAM SALVAS! :)");
-            delay(2000);
-            lcd.clear();
+          if (validarAvanco(modoMenu)) { // So avanca se a tela atual estiver certa
+            modoMenu++;
+            if (modoMenu > 8) {
+              executarSalvamento();
+              modoMenu = 0; 
+            }
           }
+          lcd.clear(); 
         }
       }
       tempoInicioSegurarMenu = 0;
       salvamentoExecutado = false;
     }
 
+    // LEITURA UP/DOWN NAS TELAS
     if (modoMenu == 1) { 
       if (upFoiClicado) { horaAjuste++; if(horaAjuste > 23) horaAjuste = 0; }
       if (downFoiClicado) { horaAjuste--; if(horaAjuste < 0) horaAjuste = 23; }
@@ -546,7 +577,8 @@ void gerenciarMenuAjuste() {
   }
 }
 //=========================================================================================================================================
-// --- FUNÇÕES DE EXIBIÇÃO NO LCD ---
+
+// --- FUNCOES DE EXIBICAO NO LCD ---
 void printHoraFormatada(int minutosTotais) {
   int h = minutosTotais / 60;
   int m = minutosTotais % 60;
@@ -558,6 +590,7 @@ void printHoraFormatada(int minutosTotais) {
 }
 
 //=========================================================================================================================================
+
 void telaAjusteHora() {
   lcd.backlight(); 
   lcd.setCursor(0, 0);
@@ -696,13 +729,13 @@ void telaNivelGama() {
 
 //=========================================================================================================================================
 
-// --- FUNÇÃO GERENCIADORA DE PWM (SOFTSTART) ---
+// --- FUNCAO GERENCIADORA DE PWM (SOFTSTART) ---
 void aplicarPWMSeguro(uint16_t pwmAlvo) {
   static uint16_t pwmRealNaPlaca = 0; 
   if (pwmAlvo == pwmRealNaPlaca) return;
 
   if (pwmAlvo > pwmRealNaPlaca) {
-    // Calcula um salto de aceleração. Se pular de 0 a 100%, faz em ~1.5 seg
+    // Calcula um salto de aceleracao. Se pular de 0 a 100%, faz em aprox. 1.5 segundos
     uint16_t salto = (pwmAlvo - pwmRealNaPlaca) / 100;
     if (salto < 1) salto = 1;
 
@@ -710,11 +743,73 @@ void aplicarPWMSeguro(uint16_t pwmAlvo) {
       OCR1A = i; // Escreve direto no registrador de hardware do Pino 9
       delay(15); 
       wdt_reset(); 
-      if (pwmAlvo - i < salto) break; // Trava de precisão para o último loop
+      if (pwmAlvo - i < salto) break; // Trava de precisão para o ultimo loop
     }
   } 
   
-  // Confirmação final exata
+  // Confirmacao final exata
   OCR1A = pwmAlvo;
   pwmRealNaPlaca = pwmAlvo; 
+}
+
+//=========================================================================================================================================
+
+// Funcao que valida a regra antes de deixar o usuario avancar de tela
+bool validarAvanco(int telaAtual) {
+  switch (telaAtual) {
+    case 4: // Tentando sair do Amanhecer Fim
+      if (t2_amanhecerFim <= t1_amanhecerIni) {
+        lcd.clear(); lcd.print("ERRO: AMANHECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        return false;
+      }
+      break;
+    case 5: // Tentando sair do Ligar Sensor
+      if (t3_diaProporcional < t2_amanhecerFim) {
+        lcd.clear(); lcd.print("ERRO: LIGAR SENS"); lcd.setCursor(0, 1); lcd.print("Sensor < Amanhec"); delay(3000);
+        return false;
+      }
+      break;
+    case 6: // Tentando sair da Luz Tarde
+      if (t4_tarde100 < t3_diaProporcional) {
+        lcd.clear(); lcd.print("ERRO: LUZ TARDE "); lcd.setCursor(0, 1); lcd.print("Tarde < Sensor  "); delay(3000);
+        return false;
+      }
+      break;
+    case 7: // Tentando sair do Anoitecer Ini
+      if (t5_anoitecerIni < t4_tarde100) {
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Anoitec. < Tarde"); delay(3000);
+        return false;
+      }
+      break;
+    case 8: // Tentando finalizar o ajuste saindo do Anoitecer Fim
+      if (t6_anoitecerFim <= t5_anoitecerIni) {
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        return false;
+      }
+      if (t6_anoitecerFim >= 1440) {
+        lcd.clear(); lcd.print("ERRO: LIMITE DIA"); lcd.setCursor(0, 1); lcd.print("Passou das 00:00"); delay(3000);
+        return false;
+      }
+      break;
+  }
+  return true; // Se a regra estiver certa (ou se for menu de relogio), permite o avanco
+}
+
+//=========================================================================================================================================
+
+// Funcao focada apenas em gravar na EEPROM quando tudo estiver validado
+void executarSalvamento() {
+  rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
+  EEPROM.put(1, t1_amanhecerIni);
+  EEPROM.put(3, t2_amanhecerFim);
+  EEPROM.put(5, t3_diaProporcional);
+  EEPROM.put(7, t4_tarde100);
+  EEPROM.put(9, t5_anoitecerIni);
+  EEPROM.put(11, t6_anoitecerFim);
+  
+  lcd.clear();
+  lcd.print("ALTERACAO  SALVA");
+  lcd.setCursor(0, 1);
+  lcd.print("  COM SUCESSO! :)");
+  delay(2000);
 }
