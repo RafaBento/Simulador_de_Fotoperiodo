@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.4
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 8.5
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -8,6 +8,22 @@
 #include <RTClib.h>
 #include <avr/wdt.h> // Watchdog
 #include <EEPROM.h>  // Memória Não Volátil
+
+//LISTA DE FUNCOES
+void controlarNivelAgua();
+void controlarLuz();
+void atualizarBarraLEDsCFTV();
+void processarDebounceBotoes();
+void gerenciarMenuAjuste();
+void telaAjusteHora();
+void telaPrincipal();
+void telaNivelAgua();
+void telaErroBomba();
+void telaNivelGama();
+void ajustarVariavelTempo(int &variavelTempo, bool aumenta);
+void aplicarPWMSeguro(byte pinoLuz, byte pwmAlvo);
+void printHoraFormatada(int minutosTotais);
+
 
 // --- MAPEAMENTO DE PINOS ---
 #define PINO_LDR        A0    // Pino para o LDR
