@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.1
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.2
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -20,7 +20,7 @@ void telaPrincipal();
 void controlarLuz();
 void atualizarBarraLEDsCFTV();
 void controlarNivelAgua();
-void aplicarPWMSeguro(uint16_t pwmValue); 
+void aplicarPWMSeguro(); 
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
 
@@ -56,32 +56,33 @@ const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
 
-// --- VARIÁVEIS GLOBAIS ---
+// --- VARIAVEIS GLOBAIS ---
 DateTime agora;
-unsigned long ultimoCicloLuz = 0;         // Cronômetro para a Luz (1s)
-unsigned long ultimoCicloUltrassom = 0;   // Cronômetro para o Ultrassom/Bomba (5s)
+unsigned long ultimoCicloLuz = 0;         // Cronometro para a Luz (1s)
+unsigned long ultimoCicloUltrassom = 0;   // Cronometro para o Ultrassom/Bomba (5s)
 
 int porcentagemAguaGlobal = 0; 
 int pwmAtualGlobal = 0; 
+uint16_t pwmAlvoGlobal = 0;
 bool estadoLuz = false;
 bool valvulaLigada = false;
 
-// --- VARIÁVEIS DE SEGURANÇA DA BOMBA ---
+// --- VARIAVEIS DE SEGURANÇA DA BOMBA ---
 unsigned long tempoBombaLigada = 0;
 const unsigned long TEMPO_MAXIMO_BOMBA = 420000; // 7 minutos em milissegundos (ajustar em campo)
 bool erroBombaTravada = false; // FLAG DE ERRO
 
 
-// Variáveis: LDR Manual Override
+// Variaveis: LDR Manual Override
 bool sensorLuzAtivo = true; 
 unsigned long tempoBotoesPressione = 0;
 bool comboPressionado = false;
 
-// Variáveis para as Telas "Pop-up" Temporárias
+// Variaveis para as Telas "Pop-up" Temporarias
 byte telaTemporariaAtiva = 0; 
 unsigned long tempoExibicaoTela = 0;
 
-// Variáveis do Cronograma (Armazenadas em Minutos)
+// Variaveis do Cronograma (Armazenadas em Minutos)
 int t1_amanhecerIni = 240;   
 int t2_amanhecerFim = 270;   
 int t3_diaProporcional = 480;
@@ -99,7 +100,7 @@ bool downFoiClicado = false;
 int modoMenu = 0; 
 int horaAjuste, minutoAjuste;
 
-byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; //apenas para enfeite no display
+byte gota[8] = {0x04,0x0E,0x1F,0x1F,0x1F,0x0E,0x00,0x00}; // Apenas para enfeite no display
 
 //=================================================================================================
 
@@ -110,9 +111,9 @@ void setup() {
   TCCR1A = 0;
   TCCR1B = 0;
 
-// PWM, Modo 14 (TOP = ICR1) | Saída não-invertida no pino 9 (COM1A1)
+// PWM, Modo 14 (TOP = ICR1) | Saada nao-invertida no pino 9 (COM1A1)
   TCCR1A = (1 << COM1A1) | (1 << WGM11);
-  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // Prescaler = 1 (Frequência máxima)
+  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // Prescaler = 1 (Frequencia maxima)
   ICR1 = 32767; // Define o teto (TOP) gerando 488 Hz exatos
   OCR1A = 0;    // Inicia com ciclo de trabalho em 0% (Luz apagada)
 
@@ -136,7 +137,7 @@ void setup() {
 
 //=================================================================================================
 
-  // Inicialização EEPROM e Leitura dos Dados
+  // Inicializacao EEPROM e Leitura dos Dados
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
     EEPROM.put(1, t1_amanhecerIni);
@@ -215,7 +216,7 @@ void loop() {
 
 //=====================================================================================
 
-  // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
+  // --- MAQUINA DE ESTADOS DO DISPLAY E REARME ---
   static unsigned long tempoSegurandoUP = 0;
 
   if (erroSuperaquecimento) {
@@ -224,15 +225,15 @@ void loop() {
     lcd.print("Superaquecimento");
     lcd.setCursor(0, 1);
     lcd.print("Luz Desligada!!!");
-    modoMenu = 0; // Força a saída de qualquer menu ativo
+    modoMenu = 0; // Forca a saada de qualquer menu ativo
   }
   else if (erroBombaTravada) {
     telaErroBomba(); // Esconde a tela principal (Prioridade 2)
     
-    // Lógica para rearmar segurando o botão UP por 5 segundos
+    // Logica para rearmar segurando o botao UP por 3 segundos
     if (digitalRead(BTN_UP) == LOW) {
       if (tempoSegurandoUP == 0) tempoSegurandoUP = millis();
-      if (millis() - tempoSegurandoUP >= 5000) {
+      if (millis() - tempoSegurandoUP >= 3000) {
         erroBombaTravada = false; // Destrava o sistema na RAM
         EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 0); // Destrava o sistema na EEPROM
         tempoSegurandoUP = 0;
@@ -242,7 +243,7 @@ void loop() {
         lcd.clear();
       }
     } else {
-      tempoSegurandoUP = 0; // Zera o cronômetro se soltar o dedo antes
+      tempoSegurandoUP = 0; // Zera o cronometro se soltar o dedo antes
     }
   } 
   else if (modoMenu > 0) {
@@ -262,25 +263,27 @@ void loop() {
       telaPrincipal(); 
     }
   }
-
-  // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
+   if (modoMenu == 0) {
+    aplicarPWMSeguro();
+    }
+   // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
-    ultimoCicloLuz += 1000; // Correção para evitar drift de tempo
+    ultimoCicloLuz += 1000; // Correcao para evitar drift de tempo
     
     if (modoMenu == 0) {
       controlarLuz();
     }
   }
 
-  // --- CICLO DO ULTRASSÔNICO E BOMBA (A cada 5 Segundos) ---
+  // --- CICLO DO ULTRASSONICO E BOMBA (A cada 5 Segundos) ---
   if (millis() - ultimoCicloUltrassom >= 5000) { 
     ultimoCicloUltrassom = millis(); 
     
     atualizarBarraLEDsCFTV(); // Faz a leitura pesada e manda via I2C
-    controlarNivelAgua();   // Avalia a histerese da válvula
+    controlarNivelAgua();   // Avalia a histerese da valvula
 }
 
-// --- CICLO TÉRMICO (A cada 30 Segundos) ---
+// --- CICLO TERMICO (A cada 30 Segundos) ---
   if (millis() - ultimoCicloTemp >= 30000) { 
     ultimoCicloTemp = millis(); 
     
@@ -298,9 +301,9 @@ void loop() {
 
 //======================================================================================
 
-// --- CONTROLE DE NÍVEL DE ÁGUA (HISTERESE) ---
+// --- CONTROLE DE NIVEL DE AGUA (HISTERESE) ---
 void controlarNivelAgua() {
-  // Intertravamento: A bomba SÓ pode ligar se NÃO houver erro travado na memória
+  // Intertravamento: A bomba So pode ligar se nao houver erro travado na memoria
   if (porcentagemAguaGlobal <= 10 && !valvulaLigada && !erroBombaTravada) {
     valvulaLigada = true; 
     tempoBombaLigada = millis(); // Marca a hora exata da partida
@@ -316,11 +319,11 @@ void controlarNivelAgua() {
     valvulaLigada = false;
     digitalWrite(PINO_VALVULA, LOW);
     
-    // Trava o sistema e salva na memória não-volátil (apenas se mudou de estado)
+    // Trava o sistema e salva na memoria nao-volatil (apenas se mudou de estado)
     if (!erroBombaTravada) {
       erroBombaTravada = true; 
       EEPROM.update(EEPROM_ADDR_ERRO_BOMBA, 1); 
-      modoMenu = 0; // Força a saída do Menu se estourar o tempo de enchimento da caixa
+      modoMenu = 0; // Forca a saida do Menu se estourar o tempo de enchimento da caixa
     }
   }
 }
@@ -339,25 +342,39 @@ void controlarLuz() {
     long segPassados = segundosDoDia - (t1_amanhecerIni * 60L);
     long segTotais = (t2_amanhecerFim - t1_amanhecerIni) * 60L;
     progresso = (float)segPassados / segTotais; // Vai de 0.0 a 1.0 suavemente
-    // Calcula a curva Gama em tempo real e joga pra escala de 15 bits
-    pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
+    pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);  // Calcula a curva Gama em tempo real e joga pra escala de 15 bits
   }
+
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
     pwmAlvo = 32767;
   }
+
 else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
-       int leituraLDR = analogRead(PINO_LDR);
-       
-       // Mapeamento dinamico: Converte a leitura analogica (0 a 1023) para o PWM de 15 bits (0 a 32767).
-       // Se ambiente ESCURO = leitura ALTA (ex: 1000), o map abaixo deixará a luz 100% no escuro.
-       long pwmMapeado = map(leituraLDR, 2, 993, 32767, 0); 
-       
-       pwmAlvo = constrain(pwmMapeado, 0, 32767); // Trava de segurança para não estourar a variável
-    } else {
-       // Logica manual: Se desligar o sensor pressionando UP+DOWN, a luz desliga
-       // Se quiser que ela fique 100% ligada ignorando o sol, basta trocar o 0 abaixo por 32767.
-       pwmAlvo = 0; 
+      static long integradorLinear = 32767; 
+      static unsigned long tempoUltimaAcao = millis();
+
+      const int ALVO_LDR = 400;   
+      const int JANELA = 80;      
+
+      if (millis() - tempoUltimaAcao >= 100) { 
+        int leituraLDR = analogRead(PINO_LDR);
+        
+        if (leituraLDR < (ALVO_LDR - JANELA)) integradorLinear += 64; 
+        else if (leituraLDR > (ALVO_LDR + JANELA)) integradorLinear -= 64; 
+
+        integradorLinear = constrain(integradorLinear, 0, 32767);
+        tempoUltimaAcao = millis();
+      }
+
+      // Converte a malha nativa para a proporção da Gama (0.0 a 1.0)
+      float progresso = integradorLinear / 32767.0;
+      
+      // Aplica a curva para garantir que a correcao pareca linear aos olhos
+      pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
+    } 
+    else {
+      pwmAlvo = 0; 
     }
   }
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
@@ -377,10 +394,7 @@ else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
   // 1 tick = 62,5ns. TLP250 precisa de 500ns = 8 ticks.
   // Se o PWM for maior que zero, mas nao tiver força pra ligar o driver, pula pro 8.
   if (pwmAlvo > 0 && pwmAlvo < 8) pwmAlvo = 8; 
-
-  aplicarPWMSeguro(pwmAlvo); 
-  estadoLuz = (pwmAlvo > 0);
-  pwmAtualGlobal = pwmAlvo;
+  pwmAlvoGlobal = pwmAlvo;
 }
 
 //========================================================================================
@@ -707,7 +721,7 @@ void telaErroBomba() {
   }
   
   lcd.setCursor(0, 1);
-  lcd.print("SEGURE UP (5s)  ");
+  lcd.print("SEGURE UP por 3s");
 }
 
 //=========================================================================================================================================
@@ -736,29 +750,43 @@ void telaNivelGama() {
 
 //=========================================================================================================================================
 
-// --- FUNCAO GERENCIADORA DE PWM (SOFTSTART) ---
-void aplicarPWMSeguro(uint16_t pwmAlvo) {
+// MAQUINA DE ESTADOS DO PWM (ASSINCRONA E NAO-BLOQUEANTE) ---
+void aplicarPWMSeguro() {
   static uint16_t pwmRealNaPlaca = 0; 
-  if (pwmAlvo == pwmRealNaPlaca) return;
+  static unsigned long tempoUltimoPasso = 0;
 
-  if (pwmAlvo > pwmRealNaPlaca) {
-    // Calcula um salto de aceleracao. Se pular de 0 a 100%, faz em aprox. 1.5 segundos
-    uint16_t salto = (pwmAlvo - pwmRealNaPlaca) / 100;
-    if (salto < 1) salto = 1;
+  // Se o brilho fisico ja chegou na meta logica, sai da funcao instantaneamente
+  if (pwmRealNaPlaca == pwmAlvoGlobal) return; 
 
-    for (uint16_t i = pwmRealNaPlaca; i <= pwmAlvo; i += salto) {
-      OCR1A = i; // Escreve direto no registrador de hardware do Pino 9
-      delay(15); 
-      wdt_reset(); 
-      if (pwmAlvo - i < salto) break; // Trava de precisão para o ultimo loop
+  // Executa 1 micro-passo a cada 2 milissegundos (SEM NENHUM DELAY)
+  if (millis() - tempoUltimoPasso >= 2) {
+    tempoUltimoPasso = millis();
+
+    // Calcula a distancia ate o alvo
+    int diferenca = pwmAlvoGlobal > pwmRealNaPlaca ? (pwmAlvoGlobal - pwmRealNaPlaca) : (pwmRealNaPlaca - pwmAlvoGlobal);
+    
+    // Aceleracao adaptativa: saltos maiores se a diferenca for grande, saltos precisos perto do fim
+    uint16_t salto = diferenca / 50; 
+    if (salto < 15) salto = 15; // Piso minimo para a rampa nao ficar lenta demais
+
+    // Rampa de Subida
+    if (pwmRealNaPlaca < pwmAlvoGlobal) {
+      pwmRealNaPlaca += salto;
+      if (pwmRealNaPlaca > pwmAlvoGlobal) pwmRealNaPlaca = pwmAlvoGlobal; // Trava no limite
+    } 
+    // Rampa de Descida
+    else {
+      if (pwmRealNaPlaca > salto) pwmRealNaPlaca -= salto;
+      else pwmRealNaPlaca = 0;
+      if (pwmRealNaPlaca < pwmAlvoGlobal) pwmRealNaPlaca = pwmAlvoGlobal; // Trava no limite
     }
-  } 
-  
-  // Confirmacao final exata
-  OCR1A = pwmAlvo;
-  pwmRealNaPlaca = pwmAlvo; 
-}
 
+    // Atualiza o registrador de hardware e as variaveis do display
+    OCR1A = pwmRealNaPlaca;
+    pwmAtualGlobal = pwmRealNaPlaca; 
+    estadoLuz = (pwmRealNaPlaca > 0);
+  }
+}
 //=========================================================================================================================================
 
 // Funcao que valida a regra antes de deixar o usuario avancar de tela

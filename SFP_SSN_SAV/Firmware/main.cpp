@@ -1,12 +1,13 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSÃO 1.0
- * Hardware: ATmega328P, DS3231, LCD I2C, Relé, IRF3205.
+/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSAO 1.1 (Refatorado)
+ * Hardware: ATmega328P, DS3231, LCD I2C, Rele, IRF3205/TLP250.
+ * Arquitetura: Non-blocking, Integrador 15-bits, PWM Assincrono.
  */
 
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <RTClib.h>
 #include <avr/wdt.h> // Watchdog
-#include <EEPROM.h>  // Memoria Nao Volátil
+#include <EEPROM.h>  // Memoria Nao Volatil
 
 // LISTA DE FUNCOES
 void processarDebounceBotoes();
@@ -15,21 +16,21 @@ void telaAjusteHora();
 void telaNivelGama();
 void telaPrincipal();
 void controlarLuz();
-void aplicarPWMSeguro(uint16_t pwmValue); 
+void aplicarPWMSeguro();
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
 
 // MAPEAMENTO DE PINOS
 #define PINO_LDR        A0    // Pino para o LDR
-#define BTN_MENU        A1    // Botão menu
-#define BTN_UP          A2    // Botão UP 
-#define BTN_DOWN        A3    // Botão DOWN
+#define BTN_MENU        A1    // Botao menu
+#define BTN_UP          A2    // Botao UP 
+#define BTN_DOWN        A3    // Botao DOWN
 #define PINO_DIMMER     9     // Pino do PWM
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
 const unsigned long tempoDebounce = 50; 
 
-// --- VARIÁVEIS DE SEGURANÇA TÉRMICA ---
+// --- VARIAVEIS DE SEGURANÇA TERMICA ---
 unsigned long ultimoCicloTemp = 0;
 bool erroSuperaquecimento = false;
 const float TEMP_CRITICA = 55.0;     // Temperatura de corte
@@ -42,23 +43,24 @@ const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
 RTC_DS3231 rtc; 
 
-// --- VARIÁVEIS GLOBAIS ---
+// --- VARIAVEIS GLOBAIS ---
 DateTime agora;
-unsigned long ultimoCicloLuz = 0;         // Cronômetro para a Luz (1s)
+unsigned long ultimoCicloLuz = 0;  // Cronometro para a Luz (1s)
 
 int pwmAtualGlobal = 0; 
+uint16_t pwmAlvoGlobal = 0; // Meta global de brilho (Novo motor)
 bool estadoLuz = false;
 
-// Variáveis: LDR Manual Override
+// Variaveis: LDR Manual Override
 bool sensorLuzAtivo = true; 
 unsigned long tempoBotoesPressione = 0;
 bool comboPressionado = false;
 
-// Variáveis para as Telas "Pop-up" Temporárias
+// Variaveis para as Telas "Pop-up" Temporarias
 byte telaTemporariaAtiva = 0; 
 unsigned long tempoExibicaoTela = 0;
 
-// Variáveis do Cronograma (Armazenadas em Minutos)
+// Variaveis do Cronograma (Armazenadas em Minutos)
 int t1_amanhecerIni = 240;   
 int t2_amanhecerFim = 270;   
 int t3_diaProporcional = 480;
@@ -85,9 +87,9 @@ void setup() {
   TCCR1A = 0;
   TCCR1B = 0;
 
-// PWM, Modo 14 (TOP = ICR1) | Saída não-invertida no pino 9 (COM1A1)
+// PWM, Modo 14 (TOP = ICR1) | Saida nao-invertida no pino 9 (COM1A1)
   TCCR1A = (1 << COM1A1) | (1 << WGM11);
-  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // Prescaler = 1 (Frequência máxima)
+  TCCR1B = (1 << WGM13) | (1 << WGM12) | (1 << CS10); // Prescaler = 1 (Frequencia maxima)
   ICR1 = 32767; // Define o teto (TOP) gerando 488 Hz exatos
   OCR1A = 0;    // Inicia com ciclo de trabalho em 0% (Luz apagada)
 
@@ -106,7 +108,7 @@ void setup() {
 
 //=================================================================================================
 
-  // Inicialização EEPROM e Leitura dos Dados
+  // Inicializacao EEPROM e Leitura dos Dados
   byte eepromStatus = EEPROM.read(0);
   if (eepromStatus != EEPROM_INIT_CODE) {
     EEPROM.put(1, t1_amanhecerIni);
@@ -180,7 +182,7 @@ void loop() {
 
 //=====================================================================================
 
-  // --- MÁQUINA DE ESTADOS DO DISPLAY E REARME ---
+  // --- MAQUINA DE ESTADOS DO DISPLAY E REARME ---
 
   if (erroSuperaquecimento) {
     // Alarme Visual de Calor (Prioridade 1)
@@ -188,7 +190,7 @@ void loop() {
     lcd.print("Superaquecimento");
     lcd.setCursor(0, 1);
     lcd.print("Luz Desligada!!!");
-    modoMenu = 0; // Força a saída de qualquer menu ativo
+    modoMenu = 0; // Forca a saida de qualquer menu ativo
   }
   else if (modoMenu > 0) {
     telaAjusteHora(); 
@@ -206,16 +208,22 @@ void loop() {
     }
   }
 
-  // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
+  // --- MOTOR DE PWM ASSINCRONO ---
+  // A placa varre essa linha milhares de vezes por segundo
+  if (modoMenu == 0) {
+    aplicarPWMSeguro();
+  }
+
+  // --- CICLO DA LUZ E LOGICA (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
-    ultimoCicloLuz += 1000; // Correção para evitar drift de tempo
+    ultimoCicloLuz += 1000; // Correcao para evitar drift de tempo
     
     if (modoMenu == 0) {
       controlarLuz();
     }
   }
 
-// --- CICLO TÉRMICO (A cada 30 Segundos) ---
+// --- CICLO TERMICO (A cada 30 Segundos) ---
   if (millis() - ultimoCicloTemp >= 30000) { 
     ultimoCicloTemp = millis(); 
     
@@ -234,6 +242,7 @@ void loop() {
 //======================================================================================
 
 // --- FOTOPERIODO E GAMA ---
+// --- FOTOPERIODO E GAMA ---
 void controlarLuz() {
   long minutosAtuais = agora.hour() * 60 + agora.minute();
   long segundosDoDia = minutosAtuais * 60 + agora.second();
@@ -245,28 +254,41 @@ void controlarLuz() {
     long segPassados = segundosDoDia - (t1_amanhecerIni * 60L);
     long segTotais = (t2_amanhecerFim - t1_amanhecerIni) * 60L;
     progresso = (float)segPassados / segTotais; // Vai de 0.0 a 1.0 suavemente
-    // Calcula a curva Gama em tempo real e joga pra escala de 15 bits
     pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
   }
   else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
+    // Início da manhã: Sempre 100%, independente de LDR ou botão
     pwmAlvo = 32767;
   }
-   else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+    // Meio do Dia: ÚNICO período onde o botão e o sensor mandam
     if (sensorLuzAtivo) {
-       int leituraLDR = analogRead(PINO_LDR);
-       
-       // Mapeamento dinamico: Converte a leitura analogica (0 a 1023) para o PWM de 15 bits (0 a 32767).
-       // Se ambiente ESCURO = leitura ALTA (ex: 1000), o map abaixo deixará a luz 100% no escuro.
-       long pwmMapeado = map(leituraLDR, 2, 993, 32767, 0); 
-       
-       pwmAlvo = constrain(pwmMapeado, 0, 32767); // Trava de segurança para não estourar a variável
-    } else {
-       // Logica manual: Se desligar o sensor pressionando UP+DOWN, a luz desliga
-       // Se quiser que ela fique 100% ligada ignorando o sol, basta trocar o 0 abaixo por 32767.
-       pwmAlvo = 0; 
+      static long integradorLinear = 32767; 
+      static unsigned long tempoUltimaAcao = millis();
+
+      const int ALVO_LDR = 400;   
+      const int JANELA = 80;      
+
+      if (millis() - tempoUltimaAcao >= 100) { 
+        int leituraLDR = analogRead(PINO_LDR);
+        
+        if (leituraLDR < (ALVO_LDR - JANELA)) integradorLinear += 64; 
+        else if (leituraLDR > (ALVO_LDR + JANELA)) integradorLinear -= 64; 
+
+        integradorLinear = constrain(integradorLinear, 0, 32767);
+        tempoUltimaAcao = millis();
+      }
+
+      progresso = integradorLinear / 32767.0;
+      pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
+    } 
+    else {
+      // Se você desligar o sensor pelo painel, a luz apaga apenas nesse período
+      pwmAlvo = 0; 
     }
   }
   else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
+    // Fim de Tarde: Sempre 100%, independente de LDR ou botão
     pwmAlvo = 32767;
   }
   else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
@@ -275,20 +297,20 @@ void controlarLuz() {
     progresso = 1.0 - ((float)segPassados / segTotais); // Decresce de 1.0 a 0.0
     pwmAlvo = (uint16_t)(pow(progresso, 2.5) * 32767.0);
   }
+  else {
+    // Madrugada / Noite: Luz apagada
+    pwmAlvo = 0;
+  }
 
   // INTERTRAVAMENTO TERMICO
   if (erroSuperaquecimento) pwmAlvo = 0;
 
   // PISO DE SOFTWARE para o TLP250
-  // 1 tick = 62,5ns. TLP250 precisa de 500ns = 8 ticks.
-  // Se o PWM for maior que zero, mas nao tiver força pra ligar o driver, pula pro 8.
   if (pwmAlvo > 0 && pwmAlvo < 8) pwmAlvo = 8; 
 
-  aplicarPWMSeguro(pwmAlvo); 
-  estadoLuz = (pwmAlvo > 0);
-  pwmAtualGlobal = pwmAlvo;
+  // Envia a meta para o Motor de PWM Assíncrono executar
+  pwmAlvoGlobal = pwmAlvo;
 }
-
 //==========================================================================================
 
 // --- BOTOES E MENU INTELIGENTE ---
@@ -538,49 +560,60 @@ void telaPrincipal() {
 
 void telaNivelGama() {
   lcd.setCursor(0, 0);
-  lcd.print(" NIVEL DE LUZ:  "); 
+  lcd.print("LDR Bruto: "); 
+  
+  int ldrCru = analogRead(PINO_LDR); 
+  lcd.print(ldrCru);
+  lcd.print("    "); 
+  
   lcd.setCursor(0, 1);
-  lcd.print("PWM:");
+  lcd.print("PWM: ");
   
-  // Atualizado para a nova escala do Timer 1 (15 bits)
   int percLuz = map(pwmAtualGlobal, 0, 32767, 0, 100);
-  
-  if (percLuz < 100) lcd.print(" "); 
-  if (percLuz < 10) lcd.print(" ");  
   lcd.print(percLuz);
   lcd.print("% ");
-  
-  // Formatacao dinamica para caber numeros de 1 a 5 digitos sem estourar a tela
-  if (pwmAtualGlobal < 10000) lcd.print(" ");
-  if (pwmAtualGlobal < 1000) lcd.print(" ");
-  if (pwmAtualGlobal < 100) lcd.print(" ");
-  if (pwmAtualGlobal < 10) lcd.print(" ");
   lcd.print(pwmAtualGlobal); 
+  lcd.print("    ");
 }
 
 //=========================================================================================================================================
 
-// --- FUNCAO GERENCIADORA DE PWM (SOFTSTART) ---
-void aplicarPWMSeguro(uint16_t pwmAlvo) {
+// --- MAQUINA DE ESTADOS DO PWM (ASSINCRONA E NAO-BLOQUEANTE) ---
+void aplicarPWMSeguro() {
   static uint16_t pwmRealNaPlaca = 0; 
-  if (pwmAlvo == pwmRealNaPlaca) return;
+  static unsigned long tempoUltimoPasso = 0;
 
-  if (pwmAlvo > pwmRealNaPlaca) {
-    // Calcula um salto de aceleracao. Se pular de 0 a 100%, faz em aprox. 1.5 segundos
-    uint16_t salto = (pwmAlvo - pwmRealNaPlaca) / 100;
-    if (salto < 1) salto = 1;
+  // Se o brilho fisico ja chegou na meta logica, sai da funcao instantaneamente
+  if (pwmRealNaPlaca == pwmAlvoGlobal) return; 
 
-    for (uint16_t i = pwmRealNaPlaca; i <= pwmAlvo; i += salto) {
-      OCR1A = i; // Escreve direto no registrador de hardware do Pino 9
-      delay(15); 
-      wdt_reset(); 
-      if (pwmAlvo - i < salto) break; // Trava de precisão para o ultimo loop
+  // Executa 1 micro-passo a cada 2 milissegundos (SEM NENHUM DELAY)
+  if (millis() - tempoUltimoPasso >= 2) {
+    tempoUltimoPasso = millis();
+
+    // Calcula a distancia ate o alvo
+    int diferenca = pwmAlvoGlobal > pwmRealNaPlaca ? (pwmAlvoGlobal - pwmRealNaPlaca) : (pwmRealNaPlaca - pwmAlvoGlobal);
+    
+    // Aceleracao adaptativa: saltos maiores se a diferença for grande, saltos precisos perto do fim
+    uint16_t salto = diferenca / 50; 
+    if (salto < 15) salto = 15; // Piso minimo para a rampa nao ficar lenta demais
+
+    // Rampa de Subida
+    if (pwmRealNaPlaca < pwmAlvoGlobal) {
+      pwmRealNaPlaca += salto;
+      if (pwmRealNaPlaca > pwmAlvoGlobal) pwmRealNaPlaca = pwmAlvoGlobal; // Trava no limite
+    } 
+    // Rampa de Descida
+    else {
+      if (pwmRealNaPlaca > salto) pwmRealNaPlaca -= salto;
+      else pwmRealNaPlaca = 0;
+      if (pwmRealNaPlaca < pwmAlvoGlobal) pwmRealNaPlaca = pwmAlvoGlobal; // Trava no limite
     }
-  } 
-  
-  // Confirmacao final exata
-  OCR1A = pwmAlvo;
-  pwmRealNaPlaca = pwmAlvo; 
+
+    // Atualiza o registrador de hardware e as variaveis do display
+    OCR1A = pwmRealNaPlaca;
+    pwmAtualGlobal = pwmRealNaPlaca; 
+    estadoLuz = (pwmRealNaPlaca > 0);
+  }
 }
 
 //=========================================================================================================================================
@@ -641,6 +674,6 @@ void executarSalvamento() {
   lcd.clear();
   lcd.print("ALTERACAO  SALVA");
   lcd.setCursor(0, 1);
-  lcd.print(" COM SUCESSO! :)");
+  lcd.print("  COM SUCESSO! :)");
   delay(2000);
 }
