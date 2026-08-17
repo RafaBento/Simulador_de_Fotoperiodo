@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.2
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.3
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  */
@@ -178,6 +178,8 @@ void setup() {
 void loop() {
   wdt_reset(); 
   
+  aplicarPWMSeguro();
+  
   if (modoMenu == 0) agora = rtc.now(); 
 
   // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ (LDR) ---
@@ -263,14 +265,12 @@ void loop() {
       telaPrincipal(); 
     }
   }
-   if (modoMenu == 0) {
-    aplicarPWMSeguro();
-    }
+  
    // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
     ultimoCicloLuz += 1000; // Correcao para evitar drift de tempo
     
-    if (modoMenu == 0) {
+   if (modoMenu == 0) {
       controlarLuz();
     }
   }
