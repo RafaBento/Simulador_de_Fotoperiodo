@@ -1,6 +1,7 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.3
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.4
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
+ * Modo automático/manual, habilita/desabilita o fotoperíodo ao pressionar os 3 botões simultaneamente por 1s.
  */
 
 #include <Wire.h>
@@ -49,8 +50,9 @@ const float TEMP_CRITICA = 55.0;     // Temperatura de corte
 const float TEMP_RECUPERACAO = 45.0; // Temperatura segura para rearmar a luz
 
 #define EEPROM_INIT_CODE 0x42 
-#define EEPROM_ADDR_LDR  13 // Endereço para salvar o status do LDR
-#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereço para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continuar travado evitando que a bomba ligue
+#define EEPROM_ADDR_LDR  13 // Endereco para salvar o status do LDR
+#define EEPROM_ADDR_ERRO_BOMBA 14 // Endereco para salvar se a bomba travou, para que se houver um reboot durante o erro, o sistema continuar travado evitando que a bomba ligue
+#define EEPROM_ADDR_FOTO 15 // Endereco para salvar o Modo Automatico/Manual
 
 // --- OBJETOS ---
 LiquidCrystal_I2C lcd(0x27, 16, 2); 
@@ -77,6 +79,8 @@ bool erroBombaTravada = false; // FLAG DE ERRO
 bool sensorLuzAtivo = true; 
 unsigned long tempoBotoesPressione = 0;
 bool comboPressionado = false;
+bool fotoperiodoAtivo = true; // true = Modo Automatico (Curva), false = Modo Manual
+bool luzManualLigada = false; // true = 100%, false = 0% no modo manual
 
 // Variaveis para as Telas "Pop-up" Temporarias
 byte telaTemporariaAtiva = 0; 
@@ -148,6 +152,7 @@ void setup() {
     EEPROM.put(11, t6_anoitecerFim);
     
     EEPROM.write(EEPROM_ADDR_LDR, 1); 
+    EEPROM.write(EEPROM_ADDR_FOTO, 1);
     EEPROM.write(EEPROM_ADDR_ERRO_BOMBA, 0); // 0 = Sem erro de bomba
     EEPROM.write(0, EEPROM_INIT_CODE); 
   } else {
@@ -159,7 +164,8 @@ void setup() {
     EEPROM.get(11, t6_anoitecerFim);
     
     sensorLuzAtivo = EEPROM.read(EEPROM_ADDR_LDR) == 1;
-    erroBombaTravada = EEPROM.read(EEPROM_ADDR_ERRO_BOMBA) == 1; 
+    erroBombaTravada = EEPROM.read(EEPROM_ADDR_ERRO_BOMBA) == 1;
+    fotoperiodoAtivo = EEPROM.read(EEPROM_ADDR_FOTO) == 1;
   }
 
   digitalWrite(PINO_VALVULA, LOW); 
@@ -182,7 +188,8 @@ void loop() {
   
   if (modoMenu == 0) agora = rtc.now(); 
 
-  // --- OVERRIDE MANUAL: LIGAR/DESLIGAR SENSOR DE LUZ (LDR) ---
+// --- OVERRIDE MANUAL E MODO AUTO/MANUAL ---
+  bool btnMenuCru = (digitalRead(BTN_MENU) == LOW);
   bool btnUpCru = (digitalRead(BTN_UP) == LOW);
   bool btnDownCru = (digitalRead(BTN_DOWN) == LOW);
 
@@ -192,20 +199,41 @@ void loop() {
       tempoBotoesPressione = millis();
     } 
     else if (millis() - tempoBotoesPressione >= 1000) {
-      sensorLuzAtivo = !sensorLuzAtivo; 
-      EEPROM.update(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
-      
       lcd.clear();
       lcd.backlight();
-      if (sensorLuzAtivo) lcd.print("SENSOR DE LUZ ON"); 
-      else lcd.print("SENSOR DE LUZ OF"); 
+      
+      // Se os 3 botoes estiverem pressionados: Alterna Automatico/Manual
+      if (btnMenuCru) {
+        fotoperiodoAtivo = !fotoperiodoAtivo; 
+        EEPROM.update(EEPROM_ADDR_FOTO, fotoperiodoAtivo ? 1 : 0);
+        
+        lcd.print("  FOTOPERIODO:  "); 
+        lcd.setCursor(0, 1);
+        lcd.print(fotoperiodoAtivo ? "AUTOMATICO (ON) " : " MODO MANUAL!   "); 
+      } 
+      // Se apenas UP e DOWN estiverem pressionados:
+      else {
+        if (fotoperiodoAtivo) {
+          // Comportamento normal: Liga/Desliga LDR
+          sensorLuzAtivo = !sensorLuzAtivo; 
+          EEPROM.update(EEPROM_ADDR_LDR, sensorLuzAtivo ? 1 : 0);
+          lcd.print(sensorLuzAtivo ? "SENSOR DE LUZ ON" : "SENSOR DE LUZ OF"); 
+        } else {
+          // Comportamento Manual: Liga/Desliga Luz Direto
+          luzManualLigada = !luzManualLigada;
+          lcd.print(" LUZ MANUAL 100%");
+          lcd.setCursor(0, 1);
+          lcd.print(luzManualLigada ? "   -> LIGADA    " : "   -> DESLIGADA ");
+        }
+      }
       
       delay(2000); 
       lcd.clear();
       
-      while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW) {
+      // Trava de seguranca para esperar o usuário soltar os botões
+      while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW || digitalRead(BTN_MENU) == LOW) { 
         wdt_reset(); 
-        delay(10);
+        delay(10); 
       }
       comboPressionado = false; 
     }
@@ -332,6 +360,15 @@ void controlarNivelAgua() {
 
 // --- FOTOPERIODO E GAMA ---
 void controlarLuz() {
+
+  if (!fotoperiodoAtivo) {  // --- SE MODO MANUAL ATIVO, IGNORA O RELOGIO INTEIRO ---
+    pwmAlvoGlobal = luzManualLigada ? 32767 : 0;
+    
+    if (erroSuperaquecimento) pwmAlvoGlobal = 0; // Protecao termica continua valendo
+    if (pwmAlvoGlobal > 0 && pwmAlvoGlobal < 8) pwmAlvoGlobal = 8;
+    return; // Sai da função imediatamente, ignorando as contas abaixo
+  }
+
   long minutosAtuais = agora.hour() * 60 + agora.minute();
   long segundosDoDia = minutosAtuais * 60 + agora.second();
   
@@ -505,7 +542,7 @@ void gerenciarMenuAjuste() {
   static bool ignorarSoltura = false; 
 
   if (modoMenu == 0) {
-    if (menuPressionado == LOW) {
+    if (menuPressionado == LOW && !comboPressionado) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 1000) {
         lcd.clear();
@@ -535,8 +572,15 @@ void gerenciarMenuAjuste() {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       
       if ((millis() - tempoInicioSegurarMenu) > 1000 && !salvamentoExecutado && !ignorarSoltura) {
-        salvamentoExecutado = true; 
-        
+        salvamentoExecutado = true;
+ 
+      if (!fotoperiodoAtivo) {
+          // Se for Modo Manual: Salva a hora direto e sai. Pula todas as validações!
+          executarSalvamento();
+          modoMenu = 0;
+        }
+        else {
+         // Se for Modo Automático: Faz a varredura normal nas 8 telas
         // LOGICA DE SALVAMENTO RAPIDO
         bool sucesso = true;
         while (modoMenu <= 8) {
@@ -551,7 +595,7 @@ void gerenciarMenuAjuste() {
           executarSalvamento();
           modoMenu = 0;
         }
-        
+        }
         tempoInicioSegurarMenu = 0; 
         menuFoiClicado = false;     
         lcd.clear();
@@ -569,10 +613,10 @@ void gerenciarMenuAjuste() {
         if (duracao < 1000 && !salvamentoExecutado) {
           if (validarAvanco(modoMenu)) { // So avanca se a tela atual estiver certa
             modoMenu++;
-            if (modoMenu > 8) {
-              executarSalvamento();
-              modoMenu = 0; 
-            }
+               if ((!fotoperiodoAtivo && modoMenu > 2) || (modoMenu > 8)) {
+                  executarSalvamento();
+                  modoMenu = 0; 
+                  }
           }
           lcd.clear(); 
         }
@@ -652,44 +696,50 @@ void telaAjusteHora() {
 //=========================================================================================================================================
 
 void telaPrincipal() {
-  lcd.setCursor(0, 0);
-  if(agora.hour() < 10) lcd.print('0');
-  lcd.print(agora.hour());
-  lcd.print(':');
-  if(agora.minute() < 10) lcd.print('0');
-  lcd.print(agora.minute());
-  lcd.print(':');
-  if(agora.second() < 10) lcd.print('0'); 
-  lcd.print(agora.second());
+   lcd.setCursor(0, 0);
+   if(agora.hour() < 10) lcd.print('0');
+   lcd.print(agora.hour());
+   lcd.print(':');
+   if(agora.minute() < 10) lcd.print('0');
+   lcd.print(agora.minute());
+   lcd.print(':');
+   if(agora.second() < 10) lcd.print('0'); 
+   lcd.print(agora.second());
   
-  lcd.print("  "); 
-  lcd.setCursor(10, 0);
-  lcd.print("Luz:");
-  if(estadoLuz) lcd.print("ON ");
-  else lcd.print("OFF");
+   lcd.print("  "); 
+   lcd.setCursor(10, 0);
+   lcd.print("Luz:");
+   if(estadoLuz) lcd.print("ON ");
+   else lcd.print("OFF");
 
-  lcd.setCursor(0, 1);
-  long minutosAtuais = agora.hour() * 60 + agora.minute();
+   lcd.setCursor(0, 1);
+   long minutosAtuais = agora.hour() * 60 + agora.minute();
 
-  if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
-    lcd.print("    Amanhecer   ");
-  } 
-  else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
-    lcd.print(" Inicio da Manha"); 
-  } 
-  else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
-    if (sensorLuzAtivo) lcd.print(" Dia: Sensor ON ");
-    else lcd.print(" Dia: Sensor OF ");
-  } 
-  else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
-    lcd.print("  Fim de Tarde  ");
-  } 
-  else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
-    lcd.print("    Anoitecer   ");
-  } 
-  else {
-    lcd.print("     Noite      ");
-  }
+   if (!fotoperiodoAtivo) {
+       lcd.print("<<<MODO MANUAL>>>");
+   }
+   else {
+   
+      if (minutosAtuais >= t1_amanhecerIni && minutosAtuais < t2_amanhecerFim) {
+         lcd.print("    Amanhecer   ");
+      }    
+      else if (minutosAtuais >= t2_amanhecerFim && minutosAtuais < t3_diaProporcional) {
+         lcd.print(" Inicio da Manha"); 
+      } 
+      else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
+         if (sensorLuzAtivo) lcd.print(" Dia: Sensor ON ");
+         else lcd.print(" Dia: Sensor OF ");
+      } 
+      else if (minutosAtuais >= t4_tarde100 && minutosAtuais < t5_anoitecerIni) {
+         lcd.print("  Fim de Tarde  ");
+      } 
+      else if (minutosAtuais >= t5_anoitecerIni && minutosAtuais < t6_anoitecerFim) {
+         lcd.print("    Anoitecer   ");
+      } 
+      else {
+         lcd.print("     Noite      ");
+      }
+   }
 }
 
 //=========================================================================================================================================
@@ -721,32 +771,40 @@ void telaErroBomba() {
   }
   
   lcd.setCursor(0, 1);
-  lcd.print("SEGURE UP por 3s");
+  lcd.print("SEGURE UP POR 3s");
 }
 
 //=========================================================================================================================================
 
 void telaNivelGama() {
   lcd.setCursor(0, 0);
-  lcd.print(" NIVEL DE LUZ:  "); 
-  lcd.setCursor(0, 1);
-  lcd.print("PWM:");
+
+  if (!fotoperiodoAtivo){
+    lcd.print("  MODO MANUAL:  "); 
+    lcd.setCursor(0, 1);
+    lcd.print(luzManualLigada ? "   LUZ LIGADA   " : " LUZ DESLIGADA  ");
+   }
+   else {
+      lcd.print(" NIVEL DE LUZ:  "); 
+      lcd.setCursor(0, 1);
+      lcd.print("PWM:");
   
   // Atualizado para a nova escala do Timer 1 (15 bits)
-  int percLuz = map(pwmAtualGlobal, 0, 32767, 0, 100);
+      int percLuz = map(pwmAtualGlobal, 0, 32767, 0, 100);
   
-  if (percLuz < 100) lcd.print(" "); 
-  if (percLuz < 10) lcd.print(" ");  
-  lcd.print(percLuz);
-  lcd.print("% ");
+      if (percLuz < 100) lcd.print(" "); 
+      if (percLuz < 10) lcd.print(" ");  
+      lcd.print(percLuz);
+      lcd.print("% ");
   
   // Formatacao dinamica para caber numeros de 1 a 5 digitos sem estourar a tela
-  if (pwmAtualGlobal < 10000) lcd.print(" ");
-  if (pwmAtualGlobal < 1000) lcd.print(" ");
-  if (pwmAtualGlobal < 100) lcd.print(" ");
-  if (pwmAtualGlobal < 10) lcd.print(" ");
-  lcd.print(pwmAtualGlobal); 
-}
+      if (pwmAtualGlobal < 10000) lcd.print(" ");
+      if (pwmAtualGlobal < 1000) lcd.print(" ");
+      if (pwmAtualGlobal < 100) lcd.print(" ");
+      if (pwmAtualGlobal < 10) lcd.print(" ");
+      lcd.print(pwmAtualGlobal);
+      } 
+ }
 
 //=========================================================================================================================================
 
@@ -763,7 +821,7 @@ void aplicarPWMSeguro() {
     tempoUltimoPasso = millis();
 
     // Calcula a distancia ate o alvo
-    int diferenca = pwmAlvoGlobal > pwmRealNaPlaca ? (pwmAlvoGlobal - pwmRealNaPlaca) : (pwmRealNaPlaca - pwmAlvoGlobal);
+    uint16_t diferenca = pwmAlvoGlobal > pwmRealNaPlaca ? (pwmAlvoGlobal - pwmRealNaPlaca) : (pwmRealNaPlaca - pwmAlvoGlobal);
     
     // Aceleracao adaptativa: saltos maiores se a diferenca for grande, saltos precisos perto do fim
     uint16_t salto = diferenca / 50; 
