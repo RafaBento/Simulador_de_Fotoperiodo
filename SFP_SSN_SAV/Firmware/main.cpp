@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSAO 1.2
+/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSAO 1.3
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, IRF3205 (TLP250).
  * Modo automatico/manual, habilita/desabilita o fotoperiodo ao pressionar os 3 botoes simultaneamente por 1s.
  */
@@ -19,6 +19,7 @@ void controlarLuz();
 void aplicarPWMSeguro(); 
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
+void esperarEAtualizarPWM(unsigned long tempoEspera);
 
 // MAPEAMENTO DE PINOS
 #define PINO_LDR        A0    // Pino para o LDR
@@ -192,13 +193,12 @@ void loop() {
         }
       }
       
-      delay(2000); 
+      esperarEAtualizarPWM(2000);
       lcd.clear();
       
-      // Trava de seguranca para esperar o usuario soltar os botoes
+      // Trava de seguranca para esperar a soltara dos botoes
       while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW || digitalRead(BTN_MENU) == LOW) { 
-        wdt_reset(); 
-        delay(10); 
+      esperarEAtualizarPWM(10);
       }
       comboPressionado = false; 
     }
@@ -295,20 +295,20 @@ void controlarLuz() {
 else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
     if (sensorLuzAtivo) {
       static long integradorLinear = 32767; 
-      static unsigned long tempoUltimaAcao = millis();
+     // static unsigned long tempoUltimaAcao = millis();
 
       const int ALVO_LDR = 400;   
       const int JANELA = 80;      
 
-      if (millis() - tempoUltimaAcao >= 100) { 
+    // if (millis() - tempoUltimaAcao >= 100) { 
         int leituraLDR = analogRead(PINO_LDR);
         
         if (leituraLDR < (ALVO_LDR - JANELA)) integradorLinear += 64; 
         else if (leituraLDR > (ALVO_LDR + JANELA)) integradorLinear -= 64; 
 
         integradorLinear = constrain(integradorLinear, 0, 32767);
-        tempoUltimaAcao = millis();
-      }
+      //  tempoUltimaAcao = millis();
+    //  }
 
       // Converte a malha nativa para a proporcao da Gama (0.0 a 1.0)
       float progresso = integradorLinear / 32767.0;
@@ -429,7 +429,7 @@ void gerenciarMenuAjuste() {
         salvamentoExecutado = true;
  
        if (!fotoperiodoAtivo) {
-          // Se for Modo Manual: Salva a hora direto e sai. Pula todas as validacoes!
+          // Se for Modo Manual: Salva a hora direto e sai. Pula todas as validacoes
            executarSalvamento();
            modoMenu = 0;
          }
@@ -445,7 +445,7 @@ void gerenciarMenuAjuste() {
             modoMenu++;
             }
 
-            if (sucesso) { // Passou pela varredura em todas as telas ileso
+            if (sucesso) { // Passou ileso pela varredura em todas as telas
                executarSalvamento();
                modoMenu = 0;
                }
@@ -674,35 +674,35 @@ bool validarAvanco(int telaAtual) {
   switch (telaAtual) {
     case 4: // Tentando sair do Amanhecer Fim
       if (t2_amanhecerFim <= t1_amanhecerIni) {
-        lcd.clear(); lcd.print("ERRO: AMANHECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: AMANHECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 5: // Tentando sair do Ligar Sensor
       if (t3_diaProporcional < t2_amanhecerFim) {
-        lcd.clear(); lcd.print("ERRO: LIGAR SENS"); lcd.setCursor(0, 1); lcd.print("Sensor < Amanhec"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LIGAR SENS"); lcd.setCursor(0, 1); lcd.print("Sensor < Amanhec"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 6: // Tentando sair da Luz Tarde
       if (t4_tarde100 < t3_diaProporcional) {
-        lcd.clear(); lcd.print("ERRO: LUZ TARDE "); lcd.setCursor(0, 1); lcd.print("Tarde < Sensor  "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LUZ TARDE "); lcd.setCursor(0, 1); lcd.print("Tarde < Sensor  "); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 7: // Tentando sair do Anoitecer Ini
       if (t5_anoitecerIni < t4_tarde100) {
-        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Anoitec. < Tarde"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Anoitec. < Tarde"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 8: // Tentando finalizar o ajuste saindo do Anoitecer Fim
       if (t6_anoitecerFim <= t5_anoitecerIni) {
-        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); esperarEAtualizarPWM(3000);
         return false;
       }
       if (t6_anoitecerFim >= 1440) {
-        lcd.clear(); lcd.print("ERRO: LIMITE DIA"); lcd.setCursor(0, 1); lcd.print("Passou das 00:00"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LIMITE DIA"); lcd.setCursor(0, 1); lcd.print("Passou das 00:00"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
@@ -726,5 +726,15 @@ void executarSalvamento() {
   lcd.print("ALTERACAO  SALVA");
   lcd.setCursor(0, 1);
   lcd.print(" COM SUCESSO! :)");
-  delay(2000);
+  esperarEAtualizarPWM(3000);
+}
+
+//=========================================================================================================================================
+
+void esperarEAtualizarPWM(unsigned long tempoEspera) {
+  unsigned long inicio = millis();
+  while (millis() - inicio < tempoEspera) {
+    aplicarPWMSeguro(); // Mantem o fade da luz rodando suavemente
+    wdt_reset();        // Alimenta o Watchdog para evitar resets
+  }
 }
