@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.4
+/* * SIMULADOR DE FOTOPERIODO - SFP_SLN_SAV - VERSÃO 9.5
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, HC-SR04, Relé, IRF3205.
  * Detecção de nível com ultrassonico e acionamento da bomba que enche o reservatório via relé.
  * Modo automático/manual, habilita/desabilita o fotoperíodo ao pressionar os 3 botões simultaneamente por 1s.
@@ -24,6 +24,7 @@ void controlarNivelAgua();
 void aplicarPWMSeguro(); 
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
+void esperarEAtualizarPWM(unsigned long tempoEspera);
 
 // --- MAPEAMENTO DE PINOS ---
 #define PINO_LDR        A0    // Pino para o LDR
@@ -173,7 +174,7 @@ void setup() {
   
   lcd.setCursor(0,0);
   lcd.print("SISTEMA INICIADO");
-  delay(1000);
+ esperarEAtualizarPWM(1000);
   lcd.clear();
 
   wdt_enable(WDTO_8S);
@@ -227,13 +228,12 @@ void loop() {
         }
       }
       
-      delay(2000); 
+      esperarEAtualizarPWM(3000);
       lcd.clear();
       
       // Trava de seguranca para esperar o usuário soltar os botões
       while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW || digitalRead(BTN_MENU) == LOW) { 
-        wdt_reset(); 
-        delay(10); 
+            esperarEAtualizarPWM(10); 
       }
       comboPressionado = false; 
     }
@@ -269,7 +269,7 @@ void loop() {
         tempoSegurandoUP = 0;
         lcd.clear();
         lcd.print(" BOMBA REARMADA ");
-        delay(2000);
+        esperarEAtualizarPWM(2000);
         lcd.clear();
       }
     } else {
@@ -392,17 +392,14 @@ else if (minutosAtuais >= t3_diaProporcional && minutosAtuais < t4_tarde100) {
       static unsigned long tempoUltimaAcao = millis();
 
       const int ALVO_LDR = 400;   
-      const int JANELA = 80;      
+      const int JANELA = 80;           
 
-      if (millis() - tempoUltimaAcao >= 100) { 
         int leituraLDR = analogRead(PINO_LDR);
         
         if (leituraLDR < (ALVO_LDR - JANELA)) integradorLinear += 64; 
         else if (leituraLDR > (ALVO_LDR + JANELA)) integradorLinear -= 64; 
 
         integradorLinear = constrain(integradorLinear, 0, 32767);
-        tempoUltimaAcao = millis();
-      }
 
       // Converte a malha nativa para a proporção da Gama (0.0 a 1.0)
       float progresso = integradorLinear / 32767.0;
@@ -450,7 +447,7 @@ int lerUltrassonicoEstavel() {
     if(duracao == 0) duracao = 30000; 
     
     soma += (duracao * 0.034 / 2);
-    delay(10); 
+    esperarEAtualizarPWM(10); 
   }
   return soma / 3;
 }
@@ -852,35 +849,35 @@ bool validarAvanco(int telaAtual) {
   switch (telaAtual) {
     case 4: // Tentando sair do Amanhecer Fim
       if (t2_amanhecerFim <= t1_amanhecerIni) {
-        lcd.clear(); lcd.print("ERRO: AMANHECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: AMANHECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 5: // Tentando sair do Ligar Sensor
       if (t3_diaProporcional < t2_amanhecerFim) {
-        lcd.clear(); lcd.print("ERRO: LIGAR SENS"); lcd.setCursor(0, 1); lcd.print("Sensor < Amanhec"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LIGAR SENS"); lcd.setCursor(0, 1); lcd.print("Sensor < Amanhec"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 6: // Tentando sair da Luz Tarde
       if (t4_tarde100 < t3_diaProporcional) {
-        lcd.clear(); lcd.print("ERRO: LUZ TARDE "); lcd.setCursor(0, 1); lcd.print("Tarde < Sensor  "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LUZ TARDE "); lcd.setCursor(0, 1); lcd.print("Tarde < Sensor  "); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 7: // Tentando sair do Anoitecer Ini
       if (t5_anoitecerIni < t4_tarde100) {
-        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Anoitec. < Tarde"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Anoitec. < Tarde"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
     case 8: // Tentando finalizar o ajuste saindo do Anoitecer Fim
       if (t6_anoitecerFim <= t5_anoitecerIni) {
-        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); delay(3000);
+        lcd.clear(); lcd.print("ERRO: ANOITECER!"); lcd.setCursor(0, 1); lcd.print("Fim <= Inicio   "); esperarEAtualizarPWM(3000);
         return false;
       }
       if (t6_anoitecerFim >= 1440) {
-        lcd.clear(); lcd.print("ERRO: LIMITE DIA"); lcd.setCursor(0, 1); lcd.print("Passou das 00:00"); delay(3000);
+        lcd.clear(); lcd.print("ERRO: LIMITE DIA"); lcd.setCursor(0, 1); lcd.print("Passou das 00:00"); esperarEAtualizarPWM(3000);
         return false;
       }
       break;
@@ -904,5 +901,14 @@ void executarSalvamento() {
   lcd.print("ALTERACAO  SALVA");
   lcd.setCursor(0, 1);
   lcd.print(" COM SUCESSO! :)");
-  delay(2000);
+ esperarEAtualizarPWM(2000);
+}
+//=========================================================================================================================================
+
+void esperarEAtualizarPWM(unsigned long tempoEspera) {
+  unsigned long inicio = millis();
+  while (millis() - inicio < tempoEspera) {
+    aplicarPWMSeguro(); // Mantem o fade da luz rodando suavemente
+    wdt_reset();        // Alimenta o Watchdog para evitar resets
+  }
 }
