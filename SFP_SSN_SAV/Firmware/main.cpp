@@ -1,4 +1,4 @@
-/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSAO 1.3
+/* * SIMULADOR DE FOTOPERIODO - SFP_SSN_SAV - VERSAO 1.4
  * Hardware: ATmega328P, DS3231, LCD I2C, LDR, IRF3205 (TLP250).
  * Modo automatico/manual, habilita/desabilita o fotoperiodo ao pressionar os 3 botoes simultaneamente por 1s.
  */
@@ -20,6 +20,9 @@ void aplicarPWMSeguro();
 void executarSalvamento();
 bool validarAvanco(int telaAtual);
 void esperarEAtualizarPWM(unsigned long tempoEspera);
+void verificarTemperatura();              // Protecao termica agora e uma funcao separada
+void descartarAlteracoes(bool mostrarAviso); // Recarrega cronograma da EEPROM e sai do menu
+void verificarBateriaRTC();               // checa se o RTC perdeu a hora (bateria CR2032 descarregada/ausente)
 
 // MAPEAMENTO DE PINOS
 #define PINO_LDR        A0    // Pino para o LDR
@@ -30,6 +33,8 @@ void esperarEAtualizarPWM(unsigned long tempoEspera);
 
 // --- CONFIGURAÇÕES DO SISTEMA ---
 const unsigned long tempoDebounce = 50; 
+const unsigned long TIMEOUT_MENU = 60000;        // 60 s sem apertar nada no menu = descarta e sai
+const unsigned long TIMEOUT_BOTAO_PRESO = 10000; // 10 s esperando soltar botao = considera botao preso
 
 // --- VARIAVEIS DE SEGURANCA TERMICA ---
 unsigned long ultimoCicloTemp = 0;
@@ -81,6 +86,9 @@ bool upFoiClicado = false;
 bool downFoiClicado = false;
 int modoMenu = 0; 
 int horaAjuste, minutoAjuste;
+unsigned long ultimaAtividadeMenu = 0; // Guarda o instante da ultima acao do usuario no menu
+bool botaoPreso = false;               // true = algum botao ficou preso; ignora combo/menu ate soltar
+bool rtcPerdeuHora = false;            // true = o RTC perdeu a hora (bateria); fica true ate o usuario acertar o relogio e salvar
 
 //=================================================================================================
 
@@ -108,6 +116,17 @@ void setup() {
   if (!rtc.begin()) {
     lcd.print("Erro no RTC!");
     while (1); 
+  }
+
+  // se o DS3231 perdeu energia (CR2032 acabou/foi removida), a hora volta para 01/01/2000 00:00
+  if (rtc.lostPower()) {
+    rtcPerdeuHora = true;                 // Guarda o alerta (aparece na tela principal ate acertar o relogio)
+    lcd.clear();                          // aviso no boot (o watchdog ainda nao foi ativado, entao o delay e seguro)
+    lcd.print("RTC PERDEU HORA!");
+    lcd.setCursor(0, 1);
+    lcd.print("Trocar bateria  ");
+    delay(3000);
+    lcd.clear();
   }
 
 //=================================================================================================
@@ -159,7 +178,11 @@ void loop() {
   bool btnUpCru = (digitalRead(BTN_UP) == LOW);
   bool btnDownCru = (digitalRead(BTN_DOWN) == LOW);
 
-  if (btnUpCru && btnDownCru && modoMenu == 0) {
+  // Quando TODOS os botoes forem soltos, libera o sistema de novo
+  if (botaoPreso && !btnMenuCru && !btnUpCru && !btnDownCru) botaoPreso = false;
+
+  // "&& !botaoPreso" para um botao preso nao ficar disparando o combo em loop
+  if (btnUpCru && btnDownCru && modoMenu == 0 && !botaoPreso) {
     if (!comboPressionado) {
       comboPressionado = true;
       tempoBotoesPressione = millis();
@@ -197,8 +220,14 @@ void loop() {
       lcd.clear();
       
       // Trava de seguranca para esperar a soltara dos botoes
+      // limite de tempo (TIMEOUT_BOTAO_PRESO) para nao prender o loop() para sempre
+      unsigned long inicioEsperaSoltar = millis(); // marca quando comecou a esperar
       while(digitalRead(BTN_UP) == LOW || digitalRead(BTN_DOWN) == LOW || digitalRead(BTN_MENU) == LOW) { 
-      esperarEAtualizarPWM(10);
+        esperarEAtualizarPWM(10); // essa funcao tambem checa a temperatura
+        if (millis() - inicioEsperaSoltar > TIMEOUT_BOTAO_PRESO) { // estourou o tempo
+          botaoPreso = true; // marca botao preso (bloqueia combo/menu ate soltar)
+          break;             // sai do while e devolve o controle ao loop()
+        }
       }
       comboPressionado = false; 
     }
@@ -209,17 +238,25 @@ void loop() {
   processarDebounceBotoes();
   gerenciarMenuAjuste();
 
+  // timeout do menu. Sem nenhum clique por 60 s, descarta as alteracoes e volta para a tela principal
+  if (modoMenu > 0 && !erroSuperaquecimento && (millis() - ultimaAtividadeMenu > TIMEOUT_MENU)) {
+    descartarAlteracoes(true);
+  }
+
 //=====================================================================================
 
   // --- MAQUINA DE ESTADOS DO DISPLAY ---
   
   if (erroSuperaquecimento) {
+    // se o superaquecimento derrubar o menu, descarta as alteracoes nao salvas
+    if (modoMenu > 0) descartarAlteracoes(false);
+
     // Alarme Visual de Calor (Prioridade 1)
     lcd.setCursor(0, 0);
     lcd.print("Superaquecimento");
     lcd.setCursor(0, 1);
     lcd.print("Luz Desligada!!!");
-    modoMenu = 0; // Forca a saada de qualquer menu ativo
+    modoMenu = 0; // Forca a saida de qualquer menu ativo
   }
   else if (modoMenu > 0) {
     telaAjusteHora(); 
@@ -239,27 +276,20 @@ void loop() {
   
    // --- CICLO DA LUZ E DISPLAY (A cada 1 Segundo) ---
   if (millis() - ultimoCicloLuz >= 1000) {
-    ultimoCicloLuz += 1000; // Correcao para evitar drift de tempo
+    // Se o loop ficou parado (menu, espera de 2 a 3 s),
+    if (millis() - ultimoCicloLuz >= 2000) {
+      ultimoCicloLuz = millis();  // atraso grande -> ressincroniza e descarta os ciclos perdidos
+    } else {
+      ultimoCicloLuz += 1000;     // Correcao para evitar drift de tempo (mantido para atrasos pequenos)
+    }
     
    if (modoMenu == 0) {
       controlarLuz();
     }
   }
 
-// --- CICLO TERMICO (A cada 30 Segundos) ---
-  if (millis() - ultimoCicloTemp >= 30000) { 
-    ultimoCicloTemp = millis(); 
-    
-    float tempAtual = rtc.getTemperature(); 
-    
-    // Trava e destrava com histerese
-    if (tempAtual >= TEMP_CRITICA) {
-      erroSuperaquecimento = true;
-    } 
-    else if (tempAtual <= TEMP_RECUPERACAO) {
-      erroSuperaquecimento = false;
-    }
-  }
+  verificarTemperatura();
+  verificarBateriaRTC(); // rechecagem periodica (a cada 60 s) caso o RTC perca a hora com o equipamento ligado
 }
 
 //======================================================================================
@@ -401,7 +431,8 @@ void gerenciarMenuAjuste() {
   static bool ignorarSoltura = false; 
 
   if (modoMenu == 0) {
-    if (menuPressionado == LOW && !comboPressionado) {
+    // "&& !botaoPreso" para um botao MENU preso nao reabrir o menu sem parar
+    if (menuPressionado == LOW && !comboPressionado && !botaoPreso) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       if ((millis() - tempoInicioSegurarMenu) > 1000) {
         lcd.clear();
@@ -410,6 +441,7 @@ void gerenciarMenuAjuste() {
         minutoAjuste = agora.minute();
         tempoInicioSegurarMenu = 0;
         ignorarSoltura = true; 
+        ultimaAtividadeMenu = millis(); // inicia a contagem do timeout ao entrar no menu
       }
     } else {
       tempoInicioSegurarMenu = 0;
@@ -422,6 +454,11 @@ void gerenciarMenuAjuste() {
     }
   } 
   else {
+    // qualquer clique ou botao MENU segurado conta como atividade e zera o timeout
+    if (menuFoiClicado || upFoiClicado || downFoiClicado || menuPressionado == LOW) {
+      ultimaAtividadeMenu = millis();
+    }
+
     if (menuPressionado == LOW) {
       if (tempoInicioSegurarMenu == 0) tempoInicioSegurarMenu = millis();
       
@@ -453,6 +490,7 @@ void gerenciarMenuAjuste() {
         tempoInicioSegurarMenu = 0; 
         menuFoiClicado = false;     
         lcd.clear();
+        ultimaAtividadeMenu = millis(); // as mensagens de erro/salvamento sao bloqueantes (ate 3 s); reinicia o timeout depois delas
         return;                    
       }
     } 
@@ -473,6 +511,7 @@ void gerenciarMenuAjuste() {
                   }
           }
           lcd.clear(); 
+          ultimaAtividadeMenu = millis(); // mesma razao acima (validarAvanco/executarSalvamento bloqueiam por 3 s)
         }
       }
       tempoInicioSegurarMenu = 0;
@@ -569,7 +608,16 @@ void telaPrincipal() {
    lcd.setCursor(0, 1);
    long minutosAtuais = agora.hour() * 60 + agora.minute();
 
-   if (!fotoperiodoAtivo) {
+   // se o RTC perdeu a hora, a linha 2 alterna a cada 2 s entre o estado normal e dois avisos
+   byte faseAviso = rtcPerdeuHora ? ((millis() / 2000) % 3) : 0;
+
+   if (faseAviso == 1) {                 //  aviso 1
+      lcd.print("!ACERTE A HORA! ");
+   }
+   else if (faseAviso == 2) {            // aviso 2
+      lcd.print("CHECAR BAT. RTC!");
+   }
+   else if (!fotoperiodoAtivo) {
        lcd.print("<<<MODO MANUAL>>>");
    }
    else {
@@ -714,7 +762,13 @@ bool validarAvanco(int telaAtual) {
 
 // Funcao focada apenas em gravar na EEPROM quando tudo estiver validado
 void executarSalvamento() {
-  rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
+  // correcao: antes o rtc.adjust() rodava sempre, regravando a hora de quando o menu foi aberto (relogio atrasava pelo tempo gasto no menu)
+  // Se o RTC perdeu a hora, o ajuste é sempre gravado ao salvar,
+  // pois o rtc.adjust() e o que limpa o flag de perda de energia (OSF) dentro do DS3231.
+  if (horaAjuste != agora.hour() || minutoAjuste != agora.minute() || rtcPerdeuHora) { // condicao de "relogio foi alterado"
+    rtc.adjust(DateTime(agora.year(), agora.month(), agora.day(), horaAjuste, minutoAjuste, 0));
+    rtcPerdeuHora = false; // relogio acertado, apaga o alerta da tela principal
+  }
   EEPROM.put(1, t1_amanhecerIni);
   EEPROM.put(3, t2_amanhecerFim);
   EEPROM.put(5, t3_diaProporcional);
@@ -736,5 +790,66 @@ void esperarEAtualizarPWM(unsigned long tempoEspera) {
   while (millis() - inicio < tempoEspera) {
     aplicarPWMSeguro(); // Mantem o fade da luz rodando suavemente
     wdt_reset();        // Alimenta o Watchdog para evitar resets
+    verificarTemperatura(); // a protecao termica continua funcionando mesmo durante as esperas bloqueantes
   }
+}
+
+//=========================================================================================================================================
+
+// funcao para a protecao termica
+void verificarTemperatura() {
+  if (millis() - ultimoCicloTemp >= 30000) { 
+    ultimoCicloTemp = millis(); 
+    
+    float tempAtual = rtc.getTemperature(); 
+    
+    // Trava e destrava com histerese
+    if (tempAtual >= TEMP_CRITICA) {
+      erroSuperaquecimento = true;
+    } 
+    else if (tempAtual <= TEMP_RECUPERACAO) {
+      erroSuperaquecimento = false;
+    }
+  }
+
+  // em erro, forca o alvo do PWM em 0 a CADA chamada. Assim a luz apaga mesmo que
+  // controlarLuz() nao esteja rodando (menu aberto, botao preso, esperas bloqueantes).
+  if (erroSuperaquecimento) pwmAlvoGlobal = 0;
+}
+
+//=========================================================================================================================================
+
+// descarta alteracoes nao salvas (recarrega da EEPROM) e fecha o menu
+void descartarAlteracoes(bool mostrarAviso) {
+  EEPROM.get(1, t1_amanhecerIni);   // recarrega os 6 tempos gravados, apagando o que foi editado na RAM
+  EEPROM.get(3, t2_amanhecerFim);
+  EEPROM.get(5, t3_diaProporcional);
+  EEPROM.get(7, t4_tarde100);
+  EEPROM.get(9, t5_anoitecerIni);
+  EEPROM.get(11, t6_anoitecerFim);
+
+  modoMenu = 0; // sai do menu (o relogio do RTC nao e alterado)
+  lcd.clear();
+
+  if (mostrarAviso) { // aviso so no timeout (no superaquecimento a tela de alarme assume)
+    lcd.print("  MENU EXPIRADO ");
+    lcd.setCursor(0, 1);
+    lcd.print(" Nada foi salvo ");
+    esperarEAtualizarPWM(2000);
+    lcd.clear();
+  }
+
+  // Se o botao MENU ainda estiver pressionado (preso), bloqueia reentrada imediata no menu
+  if (digitalRead(BTN_MENU) == LOW) botaoPreso = true;
+}
+
+//=========================================================================================================================================
+
+// verifica a cada 60 s se o DS3231 perdeu a hora (flag OSF, "Oscillator Stop Flag")
+void verificarBateriaRTC() {
+  static unsigned long ultimaChecagemBateria = 0; // cronometro proprio da checagem
+  if (millis() - ultimaChecagemBateria < 60000) return; // so checa 1x por minuto (evita I2C desnecessario)
+  ultimaChecagemBateria = millis();
+
+  if (rtc.lostPower()) rtcPerdeuHora = true; // so liga o alerta; quem desliga e o executarSalvamento() apos acertar o relogio
 }
